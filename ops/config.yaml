@@ -1,0 +1,41 @@
+server:
+  bind: "127.0.0.1"
+  port: 8080
+  base_url: "https://dev.yourdomain.tld"
+  jwt_secret: "change-me"
+runtime:
+  engine: "docker"
+  default_network: "bridge"
+  security:
+    no_new_privileges: true
+    drop_caps: ["ALL"]
+    seccomp_profile: null
+storage:
+  persist_root: "/opt/onmemos/persist"
+  cas_root: "/opt/onmemos/cas"
+workspaces:
+  default_ttl_minutes: 180
+  enforce_net_profile: false
+  default_bucket_prefix: "workspace"
+  enable_bucket_mounts: true
+  max_bucket_mounts_per_workspace: 5
+buckets:
+  enabled: true
+  provider: "gcs"  # "gcs", "s3", "azure"
+  default_region: "us-central1"
+  default_storage_class: "STANDARD"
+  mount_base_path: "/bucket"
+  gcs_project_id: "your-gcp-project-id"
+  gcs_key_file: "/path/to/service-account-key.json"
+pools:
+  - template: "python"
+    warm_size: 3
+    max_size: 12
+limits:
+  per_user:
+    max_live_workspaces: 4
+    cpu_quota: 4
+    mem_limit: "8g"
+    persist_quota_gb: 20
+    max_buckets_per_user: 10
+    bucket_quota_gb: 100

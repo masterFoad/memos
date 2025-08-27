@@ -1,0 +1,9 @@
+dev.yourdomain.tld {
+  encode zstd gzip
+  reverse_proxy 127.0.0.1:8080
+  tls you@example.com
+  log {
+    output file /var/log/caddy/onmemos.access.json
+    format json
+  }
+}

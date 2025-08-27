@@ -1,0 +1,14 @@
+[Unit]
+Description=OnMemOS v3 API
+After=network-online.target docker.service
+Wants=docker.service
+
+[Service]
+WorkingDirectory=/opt/onmemos-v3/server
+ExecStart=/usr/bin/env uvicorn app:app --host 127.0.0.1 --port 8080 --proxy-headers --http h11
+Environment=ONMEMOS_CONFIG=/opt/onmemos-v3/ops/config.yaml
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
