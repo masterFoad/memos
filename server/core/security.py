@@ -4,6 +4,7 @@ import jwt
 import os
 import secrets
 from .config import load_settings
+from server.database.factory import get_database_client
 
 _settings = load_settings()
 
@@ -53,3 +54,63 @@ def verify_api_key(x_api_key: Optional[str] = Header(None)) -> bool:
 def require_api_key(_: bool = Depends(verify_api_key)) -> bool:
     """Dependency for endpoints that require API key authentication"""
     return True
+
+async def verify_passport(x_api_key: Optional[str] = Header(None)) -> Dict:
+    """Verify passport (API key) and return user information"""
+    if not x_api_key:
+        raise HTTPException(
+            status_code=401, 
+            detail={
+                "error": "Authentication required",
+                "message": "Passport (API key) is required for this endpoint",
+                "suggestion": "Include X-API-Key header with valid passport"
+            }
+        )
+    
+    try:
+        # Get database client and ensure it's connected
+        db = get_database_client()
+        if not db._connection:
+            await db.connect()
+        
+        # Validate passport and get user info
+        user_info = await db.validate_passport(x_api_key)
+        if not user_info:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "Invalid passport",
+                    "message": "The provided passport (API key) is invalid or expired",
+                    "suggestion": "Check your passport and try again"
+                }
+            )
+        
+        # Update last_used timestamp
+        await db._execute_update(
+            "UPDATE passports SET last_used = CURRENT_TIMESTAMP WHERE passport_key = ?",
+            (x_api_key,)
+        )
+        
+        return {
+            "user_id": user_info["user_id"],
+            "email": user_info["email"],
+            "user_type": user_info["user_type"],
+            "credits": user_info["credits"],
+            "passport_key": x_api_key
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Authentication error",
+                "message": "Failed to validate passport",
+                "suggestion": "Try again later or contact support"
+            }
+        )
+
+def require_passport(user_info: Dict = Depends(verify_passport)) -> Dict:
+    """Dependency for endpoints that require passport authentication"""
+    return user_info

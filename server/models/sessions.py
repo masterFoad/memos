@@ -392,6 +392,9 @@ class StorageConfig(BaseModel):
     pvc_size: Optional[str] = Field(default="10Gi", description="PVC size")
     storage_class: Optional[str] = Field(default="standard-rwo", description="Storage class")
     
+    # Additional storage configurations for multiple mounts
+    additional_storage: Optional[List['StorageConfig']] = Field(default=None, description="Additional storage configurations")
+    
     @model_validator(mode='after')
     def validate_storage_config(self):
         storage_type = self.storage_type
@@ -404,6 +407,17 @@ class StorageConfig(BaseModel):
             if not self.pvc_name:
                 raise ValueError('pvc_name is required for PERSISTENT_VOLUME storage')
         
+        # Validate additional storage configurations
+        if self.additional_storage:
+            for i, additional in enumerate(self.additional_storage):
+                if additional.storage_type == StorageType.GCS_FUSE:
+                    if not additional.bucket_name:
+                        raise ValueError(f'bucket_name is required for additional GCS_FUSE storage at index {i}')
+                
+                elif additional.storage_type == StorageType.PERSISTENT_VOLUME:
+                    if not additional.pvc_name:
+                        raise ValueError(f'pvc_name is required for additional PERSISTENT_VOLUME storage at index {i}')
+        
         return self
 
 
@@ -414,6 +428,9 @@ class CreateSessionRequest(BaseModel):
     user: str
     workspace_id: str = Field(description="Workspace identifier for the session")
     ttl_minutes: int = 60
+    
+    # Template-based session creation
+    template_id: Optional[str] = Field(default=None, description="Template ID to use for session configuration")
     
     # User management
     user_type: Optional[UserType] = Field(default=None, description="User type for entitlements")

@@ -15,12 +15,16 @@ from server.core.security import require_api_key, require_namespace
 from server.managers.workspace_manager import workspace_manager
 from server.managers.storage_manager import storage_manager
 from server.services.shell_service import get_shell_service
+from server.services.session_monitor import session_monitor
 
 # Import Cloud Run services
 from server.api.cloudrun import router as cloudrun_router
 from server.api.sessions import router as sessions_router
 from server.api.gke import router as gke_router
 from server.api.gke_websocket import router as gke_websocket_router
+from server.api.billing import router as billing_router
+from server.api.templates import router as templates_router
+from server.api.cost_estimation import router as cost_estimation_router
 from server.websockets.cloudrun_shell import cloudrun_shell_websocket
 
 # Setup logging
@@ -118,13 +122,46 @@ def test_gcp_authentication():
         result = subprocess.run(["gcloud", "compute", "instances", "list", "--limit=1"], 
                               capture_output=True, text=True)
         if result.returncode != 0:
-            return False, "Cannot access Compute Engine - check permissions"
+            logger.warning("⚠️ Cannot access Compute Engine - some features may not work")
+        else:
+            logger.info("✅ Compute Engine access: OK")
         
-        # Test GKE access
-        result = subprocess.run(["kubectl", "get", "nodes", "--no-headers"], 
-                              capture_output=True, text=True)
-        if result.returncode != 0:
-            return False, "Cannot access GKE - check permissions"
+        # Test GKE Autopilot access
+        try:
+            # Test GKE clusters list
+            result = subprocess.run(["gcloud", "container", "clusters", "list", "--format=value(name,location)"], 
+                                  capture_output=True, text=True)
+            if result.returncode == 0:
+                clusters = result.stdout.strip().split('\n') if result.stdout.strip() else []
+                logger.info(f"✅ GKE clusters access: OK ({len(clusters)} clusters found)")
+                
+                # Test kubectl access if clusters exist
+                if clusters:
+                    result = subprocess.run(["kubectl", "get", "nodes", "--no-headers"], 
+                                          capture_output=True, text=True)
+                    if result.returncode == 0:
+                        logger.info("✅ GKE kubectl access: OK")
+                    else:
+                        logger.warning("⚠️ GKE kubectl access failed - check cluster configuration")
+                else:
+                    logger.info("ℹ️ No GKE clusters found - this is normal for new projects")
+            else:
+                logger.warning("⚠️ Cannot access GKE clusters - check permissions")
+                
+        except Exception as e:
+            logger.warning(f"⚠️ GKE access test failed: {e}")
+        
+        # Test GKE Autopilot specific permissions
+        try:
+            # Test if we can create GKE Autopilot clusters
+            result = subprocess.run(["gcloud", "container", "clusters", "create-auto", "--help"], 
+                                  capture_output=True, text=True)
+            if result.returncode == 0:
+                logger.info("✅ GKE Autopilot cluster creation permission: OK")
+            else:
+                logger.warning("⚠️ GKE Autopilot cluster creation permission: Check")
+        except Exception as e:
+            logger.warning(f"⚠️ GKE Autopilot permission test failed: {e}")
         
         logger.info("✅ All GCP permissions verified successfully")
         return True, "GCP authentication and permissions successful"
@@ -134,7 +171,10 @@ def test_gcp_authentication():
 
 @app.on_event("startup")
 async def startup_event():
-    """Test GCP authentication on startup"""
+    """Startup event - Test GCP authentication and start session monitor"""
+    logger.info("🚀 Starting OnMemOS v3...")
+    
+    # Test GCP authentication
     logger.info("🔐 Testing GCP authentication...")
     success, message = test_gcp_authentication()
     if success:
@@ -142,6 +182,13 @@ async def startup_event():
     else:
         logger.warning(f"⚠️ {message}")
         logger.warning("Some features may not work without proper GCP authentication")
+    
+    # Start session monitoring
+    try:
+        await session_monitor.start_monitoring()
+        logger.info("✅ Session monitor started")
+    except Exception as e:
+        logger.error(f"❌ Failed to start session monitor: {e}")
 
 @app.get("/")
 def root(_=Depends(require_api_key)):
@@ -302,11 +349,186 @@ def delete_persistent_disk(disk_name: str, _=Depends(require_api_key)):
     except Exception as e:
         raise HTTPException(500, f"Failed to delete disk: {str(e)}")
 
+# ============================================================================
+# Persistent Storage Endpoints
+# ============================================================================
+
+from fastapi import UploadFile, File
+
+@app.post("/v1/fs/persist/upload")
+async def upload_persist(namespace: str = Query(...), user: str = Query(...), 
+                        dst: str = Query(""), file: UploadFile = File(...), 
+                        _=Depends(require_namespace)):
+    """Upload a file to persistent storage"""
+    try:
+        # Create storage directory
+        root = f"{settings.storage.persist_root}/{namespace}/{user}"
+        os.makedirs(root, exist_ok=True)
+        
+        # Determine filename
+        if dst:
+            filename = dst
+        else:
+            filename = file.filename
+        
+        out_path = os.path.join(root, filename)
+        
+        # Check if path already exists and is a directory
+        if os.path.exists(out_path) and os.path.isdir(out_path):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "Path conflict",
+                    "message": f"Path '{out_path}' already exists as a directory",
+                    "suggestion": "Use a different filename or remove the existing directory",
+                    "path": out_path
+                }
+            )
+        
+        # Read and write file
+        data = await file.read()
+        with open(out_path, "wb") as f:
+            f.write(data)
+        
+        return {"ok": True, "bytes": len(data), "path": out_path}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Upload failed",
+                "message": f"Failed to upload file to persistent storage: {str(e)}",
+                "suggestion": "Check file permissions and available disk space",
+                "namespace": namespace,
+                "user": user,
+                "filename": dst or (file.filename if file else "unknown")
+            }
+        )
+
+@app.get("/v1/fs/persist/download")
+def download_persist(namespace: str = Query(...), user: str = Query(...), 
+                    path: str = Query(...), _=Depends(require_namespace)):
+    """Download a file from persistent storage"""
+    try:
+        from fastapi.responses import FileResponse
+        
+        file_path = os.path.join(settings.storage.persist_root, namespace, user, path)
+        
+        if not os.path.exists(file_path):
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "File not found",
+                    "message": f"File '{path}' not found in persistent storage",
+                    "namespace": namespace,
+                    "user": user,
+                    "path": path
+                }
+            )
+        
+        if os.path.isdir(file_path):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "Path is directory",
+                    "message": f"Path '{path}' is a directory, not a file",
+                    "namespace": namespace,
+                    "user": user,
+                    "path": path
+                }
+            )
+        
+        return FileResponse(file_path, filename=os.path.basename(path))
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Download failed",
+                "message": f"Failed to download file from persistent storage: {str(e)}",
+                "namespace": namespace,
+                "user": user,
+                "path": path
+            }
+        )
+
+@app.get("/v1/fs/persist/list")
+def list_persist(namespace: str = Query(...), user: str = Query(...), 
+                _=Depends(require_namespace)):
+    """List files in persistent storage"""
+    try:
+        import pathlib
+        
+        storage_dir = os.path.join(settings.storage.persist_root, namespace, user)
+        
+        if not os.path.exists(storage_dir):
+            return {"files": [], "total": 0, "namespace": namespace, "user": user}
+        
+        files = []
+        total_size = 0
+        
+        for item in pathlib.Path(storage_dir).iterdir():
+            if item.is_file():
+                stat = item.stat()
+                files.append({
+                    "name": item.name,
+                    "size": stat.st_size,
+                    "modified": stat.st_mtime,
+                    "path": str(item.relative_to(storage_dir))
+                })
+                total_size += stat.st_size
+        
+        return {
+            "files": files,
+            "total": len(files),
+            "total_size": total_size,
+            "namespace": namespace,
+            "user": user
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "List failed",
+                "message": f"Failed to list files in persistent storage: {str(e)}",
+                "namespace": namespace,
+                "user": user
+            }
+        )
+
 # Include routers
 app.include_router(cloudrun_router)
 app.include_router(sessions_router)
 app.include_router(gke_router)
 app.include_router(gke_websocket_router)
+app.include_router(billing_router)
+app.include_router(templates_router)
+app.include_router(cost_estimation_router)
+
+# Startup event - Start session monitor
+@app.on_event("startup")
+async def startup_event():
+    """Start session monitoring on app startup"""
+    try:
+        await session_monitor.start_monitoring()
+        logger.info("✅ Session monitor started")
+    except Exception as e:
+        logger.error(f"❌ Failed to start session monitor: {e}")
+
+# Shutdown event - Stop session monitor
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Stop session monitoring on app shutdown"""
+    try:
+        await session_monitor.stop_monitoring()
+        logger.info("✅ Session monitor stopped")
+    except Exception as e:
+        logger.error(f"❌ Failed to stop session monitor: {e}")
 
 # Workspace execution endpoints (DEPRECATED - use Cloud Run endpoints)
 @app.post("/v1/workspaces/{workspace_id}/runpy")

@@ -16,6 +16,8 @@ from websockets.exceptions import ConnectionClosed
 
 from server.core.logging import get_websocket_logger, get_gke_logger
 from .gke_service import gke_service
+from server.database.factory import get_database_client
+from server.services.billing_service import BillingService
 
 websocket_logger = get_websocket_logger()
 gke_logger = get_gke_logger()
@@ -50,15 +52,17 @@ class ShellResponse:
     metadata: Optional[Dict[str, Any]] = None
 
 class GKEShellSession:
-    """Individual WebSocket session for GKE interactive shell"""
+    """Individual WebSocket session for GKE interactive shell with billing integration"""
     
     def __init__(self, websocket: WebSocket, session_id: str, 
-                 k8s_ns: str, pod_name: str, shell_service: 'GKEShellService'):
+                 k8s_ns: str, pod_name: str, shell_service: 'GKEShellService',
+                 user_id: str = None):
         self.websocket = websocket
         self.session_id = session_id
         self.k8s_ns = k8s_ns
         self.pod_name = pod_name
         self.shell_service = shell_service
+        self.user_id = user_id
         self.is_running = False
         self.command_history: List[str] = []
         self.max_history = 100
@@ -67,12 +71,20 @@ class GKEShellSession:
         self.created_at = datetime.now(timezone.utc)
         self.last_activity = self.created_at
         self.command_count = 0
+        
+        # Billing integration
+        self.billing_start_time = None
+        self.db = None
+        self.billing_service = None
     
     async def run(self):
-        """Main session loop"""
+        """Main session loop with billing integration"""
         self.is_running = True
         
         try:
+            # Initialize billing services
+            await self._init_billing()
+            
             # Check if we should be quiet (for testing)
             quiet = False
             try:
@@ -89,6 +101,10 @@ class GKEShellSession:
                     content="🚀 Welcome to OnMemOS GKE Interactive Shell!\nType /help for available commands.",
                     timestamp=datetime.now(timezone.utc).isoformat()
                 ))
+                
+                # Send billing info
+                if self.user_id:
+                    await self._send_billing_info()
                 
                 # Send prompt
                 await self._send_prompt()
@@ -206,8 +222,14 @@ class GKEShellSession:
         await self._send_prompt()
     
     async def _handle_shell_command(self, command: str):
-        """Handle regular shell commands"""
+        """Handle regular shell commands with credit checking"""
         try:
+            # Check credits before executing command
+            if not await self._check_credits():
+                # Terminate session if no credits
+                await self.close()
+                return
+            
             # Execute command in pod using gke_service
             result = gke_service.exec_in_workspace(
                 workspace_id=self.session_id,
@@ -246,6 +268,57 @@ class GKEShellSession:
             ))
         
         await self._send_prompt()
+    
+    async def _init_billing(self):
+        """Initialize billing services and start session billing"""
+        try:
+            if self.user_id:
+                # Initialize database and billing service
+                self.db = get_database_client()
+                await self.db.connect()
+                self.billing_service = BillingService()
+                
+                # Start session billing
+                billing_info = await self.billing_service.start_session_billing(
+                    self.session_id, 
+                    self.user_id, 
+                    "gke_shell"  # Special tier for GKE shell sessions
+                )
+                self.billing_start_time = datetime.now(timezone.utc)
+                websocket_logger.info(f"Started GKE shell billing: {self.session_id} for user {self.user_id}")
+                
+        except Exception as e:
+            websocket_logger.error(f"Failed to initialize billing for session {self.session_id}: {e}")
+    
+    async def _check_credits(self) -> bool:
+        """Check if user has sufficient credits"""
+        try:
+            if self.user_id and self.db:
+                current_credits = await self.db.get_user_credits(self.user_id)
+                if current_credits <= 0:
+                    await self.send_response(ShellResponse(
+                        type="error",
+                        content="💳 Insufficient credits. Session will be terminated.",
+                        timestamp=datetime.now(timezone.utc).isoformat()
+                    ))
+                    return False
+            return True
+        except Exception as e:
+            websocket_logger.error(f"Error checking credits: {e}")
+            return True  # Allow continuation on error
+    
+    async def _send_billing_info(self):
+        """Send current billing information"""
+        try:
+            if self.user_id and self.db:
+                current_credits = await self.db.get_user_credits(self.user_id)
+                await self.send_response(ShellResponse(
+                    type="info",
+                    content=f"💳 Current Credits: ${current_credits:.2f}",
+                    timestamp=datetime.now(timezone.utc).isoformat()
+                ))
+        except Exception as e:
+            websocket_logger.error(f"Error sending billing info: {e}")
     
     async def _handle_ping(self):
         """Handle ping message"""
@@ -305,6 +378,37 @@ class GKEShellSession:
             content=prompt,
             timestamp=datetime.now(timezone.utc).isoformat()
         ))
+    
+    async def close(self):
+        """Close session and cleanup billing"""
+        self.is_running = False
+        
+        try:
+            # Stop billing
+            if self.billing_service and self.session_id:
+                final_billing = await self.billing_service.stop_session_billing(self.session_id)
+                if final_billing:
+                    total_cost = final_billing.get('total_cost', 0)
+                    total_hours = final_billing.get('total_hours', 0)
+                    websocket_logger.info(f"GKE shell session {self.session_id} billing completed: {total_hours:.2f} hours = ${total_cost:.4f}")
+                    
+                    # Deduct credits from user account
+                    if total_cost > 0 and self.user_id and self.db:
+                        await self.db.deduct_credits(
+                            self.user_id, 
+                            total_cost, 
+                            f"GKE shell session {self.session_id} runtime",
+                            session_id=self.session_id
+                        )
+                        websocket_logger.info(f"Deducted ${total_cost:.4f} from user {self.user_id} for GKE shell session {self.session_id}")
+        except Exception as e:
+            websocket_logger.error(f"Failed to cleanup billing for GKE shell session {self.session_id}: {e}")
+        
+        # Close WebSocket connection
+        try:
+            await self.websocket.close()
+        except Exception as e:
+            websocket_logger.error(f"Error closing WebSocket: {e}")
     
     async def send_response(self, response: ShellResponse):
         """Send response to client"""
@@ -373,6 +477,14 @@ class GKEShellService:
             usage="/status",
             category=ShellCommandType.SYSTEM,
             handler=self._cmd_status
+        ))
+        
+        self.register_command(ShellCommand(
+            name="credits",
+            description="Show current credit balance",
+            usage="/credits",
+            category=ShellCommandType.SYSTEM,
+            handler=self._cmd_credits
         ))
         
         self.register_command(ShellCommand(
@@ -481,8 +593,8 @@ class GKEShellService:
         self.commands[f"/{command.name}"] = command
         gke_logger.info(f"Registered GKE command: /{command.name}")
     
-    async def handle_websocket(self, websocket: WebSocket, session_id: str, k8s_ns: str, pod_name: str):
-        """Handle WebSocket connection for interactive shell"""
+    async def handle_websocket(self, websocket: WebSocket, session_id: str, k8s_ns: str, pod_name: str, user_id: str = None):
+        """Handle WebSocket connection for interactive shell with billing integration"""
         
         try:
             # Normalize k8s namespace to include the prefix
@@ -493,11 +605,11 @@ class GKEShellService:
             except Exception:
                 pass
             
-            # Create shell session
-            session = GKEShellSession(websocket, session_id, k8s_ns, pod_name, self)
+            # Create shell session with user_id for billing
+            session = GKEShellSession(websocket, session_id, k8s_ns, pod_name, self, user_id)
             self.active_sessions[session_id] = session
             
-            websocket_logger.info(f"GKE shell session started: {session_id} for pod {pod_name} in {k8s_ns}")
+            websocket_logger.info(f"GKE shell session started: {session_id} for pod {pod_name} in {k8s_ns} (user: {user_id})")
             
             # Handle shell interaction
             await session.run()
@@ -552,6 +664,28 @@ class GKEShellService:
             return ShellResponse("info", status_text, datetime.now(timezone.utc).isoformat())
         except Exception as e:
             return ShellResponse("error", f"Failed to get status: {str(e)}", datetime.now(timezone.utc).isoformat())
+    
+    async def _cmd_credits(self, session: GKEShellSession, args: List[str]) -> ShellResponse:
+        """Handle /credits command"""
+        try:
+            if session.user_id and session.db:
+                current_credits = await session.db.get_user_credits(session.user_id)
+                credits_text = f"💳 Credit Balance:\n"
+                credits_text += f"🔹 User: {session.user_id}\n"
+                credits_text += f"🔹 Current Credits: ${current_credits:.2f}\n"
+                credits_text += f"🔹 Session ID: {session.session_id}\n"
+                
+                # Add billing info if available
+                if session.billing_start_time:
+                    duration = datetime.now(timezone.utc) - session.billing_start_time
+                    hours = duration.total_seconds() / 3600.0
+                    credits_text += f"🔹 Session Duration: {hours:.2f} hours\n"
+                
+                return ShellResponse("info", credits_text, datetime.now(timezone.utc).isoformat())
+            else:
+                return ShellResponse("warning", "Billing not available for this session", datetime.now(timezone.utc).isoformat())
+        except Exception as e:
+            return ShellResponse("error", f"Failed to get credits: {str(e)}", datetime.now(timezone.utc).isoformat())
     
     async def _cmd_clear(self, session: GKEShellSession, args: List[str]) -> ShellResponse:
         """Handle /clear command"""

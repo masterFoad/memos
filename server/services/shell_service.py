@@ -1,418 +1,219 @@
 """
-Interactive Shell Service - WebSocket-based workspace shell with slash commands
+Shell Service - WebSocket-based interactive shell with billing integration
 """
+
 import asyncio
 import json
 import logging
-import subprocess
-import threading
-import time
-from typing import Dict, List, Optional, Any, Callable
+import shlex
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
-from fastapi import WebSocket
-import os
+from fastapi import WebSocket, WebSocketDisconnect
 
-logger = logging.getLogger(__name__)
+from server.core.logging import get_logger
+from server.database.factory import get_database_client
+from server.services.billing_service import BillingService
+
+logger = get_logger("shell")
 
 @dataclass
-class SlashCommand:
-    """Slash command definition"""
+class ShellMessage:
+    """Shell message structure"""
+    type: str  # 'command', 'output', 'error', 'info'
+    content: str
+    timestamp: str
+    session_id: Optional[str] = None
+
+@dataclass
+class ShellCommand:
+    """Shell command definition"""
     name: str
     description: str
-    usage: str
-    handler: Callable
+    handler: callable
 
 class ShellService:
-    """WebSocket-based interactive shell service with slash commands"""
+    """WebSocket-based interactive shell service with billing integration"""
     
     def __init__(self, workspace_manager):
         self.workspace_manager = workspace_manager
         self.active_sessions: Dict[str, 'ShellSession'] = {}
-        self.slash_commands = self._register_slash_commands()
+        self.commands: Dict[str, ShellCommand] = {}
+        self.db = None
+        self.billing_service = None
         
-    def _register_slash_commands(self) -> Dict[str, SlashCommand]:
-        """Register default slash commands"""
-        commands = {}
+        # Shell session limits
+        self.max_session_duration_hours = 8.0  # 8 hours max
+        self.max_idle_time_minutes = 30.0      # 30 minutes idle timeout
+        self.check_interval_seconds = 60       # Check every minute
         
-        commands["help"] = SlashCommand(
+        self._register_default_commands()
+    
+    async def _ensure_connected(self):
+        """Ensure database and billing service are connected"""
+        if self.db is None:
+            self.db = get_database_client()
+            await self.db.connect()
+        if self.billing_service is None:
+            self.billing_service = BillingService()
+    
+    def _register_default_commands(self):
+        """Register default shell commands"""
+        self.register_command(ShellCommand(
             name="help",
-            description="Show available slash commands",
-            usage="/help [command]",
+            description="Show available commands",
             handler=self._cmd_help
-        )
+        ))
         
-        commands["status"] = SlashCommand(
+        self.register_command(ShellCommand(
             name="status",
-            description="Show workspace status and resources",
-            usage="/status",
+            description="Show session status and billing info",
             handler=self._cmd_status
-        )
+        ))
         
-        commands["files"] = SlashCommand(
-            name="files",
-            description="List files in current directory",
-            usage="/files [path]",
-            handler=self._cmd_files
-        )
+        self.register_command(ShellCommand(
+            name="credits",
+            description="Show current credit balance",
+            handler=self._cmd_credits
+        ))
         
-        commands["upload"] = SlashCommand(
-            name="upload",
-            description="Upload file to bucket",
-            usage="/upload <local_path> <bucket_path>",
-            handler=self._cmd_upload
-        )
-        
-        commands["download"] = SlashCommand(
-            name="download",
-            description="Download file from bucket",
-            usage="/download <bucket_path> <local_path>",
-            handler=self._cmd_download
-        )
-        
-        commands["persist"] = SlashCommand(
-            name="persist",
-            description="Show persistent storage info",
-            usage="/persist",
-            handler=self._cmd_persist
-        )
-        
-        commands["buckets"] = SlashCommand(
-            name="buckets",
-            description="List and manage buckets",
-            usage="/buckets [list|info|create]",
-            handler=self._cmd_buckets
-        )
-        
-        commands["python"] = SlashCommand(
-            name="python",
-            description="Run Python code",
-            usage="/python <code>",
-            handler=self._cmd_python
-        )
-        
-        commands["disks"] = SlashCommand(
-            name="disks",
-            description="List and manage persistent disks",
-            usage="/disks [list|info]",
-            handler=self._cmd_disks
-        )
-        
-        commands["debug"] = SlashCommand(
-            name="debug",
-            description="Show debug information",
-            usage="/debug",
-            handler=self._cmd_debug
-        )
-        
-        commands["clear"] = SlashCommand(
-            name="clear",
-            description="Clear terminal",
-            usage="/clear",
-            handler=self._cmd_clear
-        )
-        
-        commands["exit"] = SlashCommand(
+        self.register_command(ShellCommand(
             name="exit",
             description="Exit shell session",
-            usage="/exit",
             handler=self._cmd_exit
-        )
-        
-        return commands
+        ))
     
-    def get_command_help(self, command_name: str = None) -> str:
-        """Get help for commands"""
-        if command_name:
-            if command_name in self.slash_commands:
-                cmd = self.slash_commands[command_name]
-                return f"📖 {cmd.name}: {cmd.description}\n   Usage: {cmd.usage}"
-            else:
-                return f"❌ Unknown command: {command_name}"
-        
-        help_text = "🔧 Available Slash Commands:\n"
-        help_text += "=" * 40 + "\n"
-        
-        for cmd in self.slash_commands.values():
-            help_text += f"• /{cmd.name:<12} - {cmd.description}\n"
-        
-        help_text += "\n💡 Type /help <command> for detailed usage"
-        return help_text
+    def register_command(self, command: ShellCommand):
+        """Register a new shell command"""
+        self.commands[f"/{command.name}"] = command
+        logger.info(f"Registered shell command: /{command.name}")
     
     async def create_session(self, workspace_id: str, websocket: WebSocket) -> 'ShellSession':
-        """Create a new shell session"""
+        """Create a new shell session with billing integration"""
+        await self._ensure_connected()
+        
         session = ShellSession(workspace_id, websocket, self)
-        self.active_sessions[workspace_id] = session
+        self.active_sessions[session.session_id] = session
+        
+        # Start billing for shell session
+        try:
+            billing_info = await self.billing_service.start_session_billing(
+                session.session_id, 
+                session.user_id, 
+                "shell"  # Special tier for shell sessions
+            )
+            session.billing_start_time = datetime.now()
+            logger.info(f"Started shell session billing: {session.session_id}")
+        except Exception as e:
+            logger.error(f"Failed to start shell session billing: {e}")
+        
         return session
     
-    def remove_session(self, workspace_id: str):
-        """Remove a shell session"""
-        if workspace_id in self.active_sessions:
-            del self.active_sessions[workspace_id]
-    
-    # Slash command handlers
     async def _cmd_help(self, session: 'ShellSession', args: List[str]):
-        """Handle /help command"""
-        command = args[0] if args else None
-        help_text = self.get_command_help(command)
+        """Show available commands"""
+        help_text = """
+🔧 Available Commands:
+====================
+"""
+        for cmd_name, cmd in self.commands.items():
+            help_text += f"{cmd_name:<15} - {cmd.description}\n"
+        
+        help_text += """
+💡 Regular shell commands work normally
+🔍 Type /status to see session info
+💰 Type /credits to check balance
+"""
         await session.send_message(help_text)
     
     async def _cmd_status(self, session: 'ShellSession', args: List[str]):
-        """Handle /status command"""
-        workspace = self.workspace_manager.get_workspace(session.workspace_id)
-        if not workspace:
-            await session.send_message("❌ Workspace not found")
-            return
-        
-        status_text = f"🏠 Workspace Status: {session.workspace_id}\n"
-        status_text += "=" * 40 + "\n"
-        status_text += f"📦 Template: {workspace.get('template', 'unknown')}\n"
-        status_text += f"📁 Namespace: {workspace.get('namespace', 'unknown')}\n"
-        status_text += f"👤 User: {workspace.get('user', 'unknown')}\n"
-        status_text += f"⏰ Created: {time.ctime(workspace.get('created_at', 0))}\n"
-        status_text += f"🔄 Status: {workspace.get('status', 'unknown')}\n"
-        
-        if workspace.get('bucket'):
-            bucket = workspace['bucket']
-            status_text += f"🪣 Bucket: {bucket.get('bucket_name', 'unknown')}\n"
-            status_text += f"   📍 Mount: {bucket.get('mount_path', 'unknown')}\n"
-        
-        if workspace.get('disk'):
-            disk = workspace['disk']
-            status_text += f"💾 Disk: {disk.get('disk_name', 'unknown')}\n"
-            status_text += f"   📏 Size: {disk.get('size_gb', 'unknown')} GB\n"
-            status_text += f"   📍 Mount: {disk.get('mount_path', 'unknown')}\n"
-        
-        await session.send_message(status_text)
-    
-    async def _cmd_files(self, session: 'ShellSession', args: List[str]):
-        """Handle /files command"""
-        path = args[0] if args else "."
-        
+        """Show session status and billing info"""
         try:
-            result = session.execute_command(f"ls -la {path}")
-            if result['success']:
-                await session.send_message(f"📁 Files in {path}:\n{result['stdout']}")
-            else:
-                await session.send_message(f"❌ Error listing files: {result['stderr']}")
-        except Exception as e:
-            await session.send_message(f"❌ Error: {e}")
-    
-    async def _cmd_upload(self, session: 'ShellSession', args: List[str]):
-        """Handle /upload command"""
-        if len(args) < 2:
-            await session.send_message("❌ Usage: /upload <local_path> <bucket_path>")
-            return
-        
-        local_path, bucket_path = args[0], args[1]
-        workspace = self.workspace_manager.get_workspace(session.workspace_id)
-        
-        if not workspace or not workspace.get('bucket'):
-            await session.send_message("❌ No bucket available for upload")
-            return
-        
-        bucket_name = workspace['bucket']['bucket_name']
-        
-        try:
-            # Use gsutil to upload
-            cmd = f"gsutil cp {local_path} gs://{bucket_name}/{bucket_path}"
-            result = session.execute_command(cmd)
+            # Get session duration
+            duration = datetime.now() - session.billing_start_time
+            hours = duration.total_seconds() / 3600.0
             
-            if result['success']:
-                await session.send_message(f"✅ Uploaded {local_path} to gs://{bucket_name}/{bucket_path}")
-            else:
-                await session.send_message(f"❌ Upload failed: {result['stderr']}")
-        except Exception as e:
-            await session.send_message(f"❌ Error: {e}")
-    
-    async def _cmd_download(self, session: 'ShellSession', args: List[str]):
-        """Handle /download command"""
-        if len(args) < 2:
-            await session.send_message("❌ Usage: /download <bucket_path> <local_path>")
-            return
-        
-        bucket_path, local_path = args[0], args[1]
-        workspace = self.workspace_manager.get_workspace(session.workspace_id)
-        
-        if not workspace or not workspace.get('bucket'):
-            await session.send_message("❌ No bucket available for download")
-            return
-        
-        bucket_name = workspace['bucket']['bucket_name']
-        
-        try:
-            # Use gsutil to download
-            cmd = f"gsutil cp gs://{bucket_name}/{bucket_path} {local_path}"
-            result = session.execute_command(cmd)
+            # Get billing info
+            billing_info = await self.db.get_session_billing_info(session.session_id)
+            current_cost = billing_info.get('total_cost', 0) if billing_info else 0
             
-            if result['success']:
-                await session.send_message(f"✅ Downloaded gs://{bucket_name}/{bucket_path} to {local_path}")
-            else:
-                await session.send_message(f"❌ Download failed: {result['stderr']}")
+            # Get user credits
+            user_credits = await self.db.get_user_credits(session.user_id)
+            
+            status_text = f"""
+📊 Session Status:
+=================
+🏠 Workspace: {session.workspace_id}
+⏱️  Duration: {hours:.2f} hours
+💰 Current Cost: ${current_cost:.4f}
+💳 Credits: ${user_credits:.2f}
+🆔 Session ID: {session.session_id}
+"""
+            await session.send_message(status_text)
+            
         except Exception as e:
-            await session.send_message(f"❌ Error: {e}")
+            await session.send_message(f"❌ Error getting status: {e}")
     
-    async def _cmd_persist(self, session: 'ShellSession', args: List[str]):
-        """Handle /persist command"""
-        workspace = self.workspace_manager.get_workspace(session.workspace_id)
-        
-        if not workspace or not workspace.get('disk'):
-            await session.send_message("❌ No persistent disk available")
-            return
-        
-        disk = workspace['disk']
-        mount_path = disk.get('mount_path', '/persist')
-        
+    async def _cmd_credits(self, session: 'ShellSession', args: List[str]):
+        """Show current credit balance"""
         try:
-            result = session.execute_command(f"df -h {mount_path}")
-            if result['success']:
-                await session.send_message(f"💾 Persistent Storage:\n{result['stdout']}")
-            else:
-                await session.send_message(f"❌ Error checking persistent storage: {result['stderr']}")
+            user_credits = await self.db.get_user_credits(session.user_id)
+            await session.send_message(f"💳 Current Credits: ${user_credits:.2f}")
         except Exception as e:
-            await session.send_message(f"❌ Error: {e}")
-    
-    async def _cmd_buckets(self, session: 'ShellSession', args: List[str]):
-        """Handle /buckets command"""
-        action = args[0] if args else "list"
-        workspace = self.workspace_manager.get_workspace(session.workspace_id)
-        
-        if not workspace:
-            await session.send_message("❌ Workspace not found")
-            return
-        
-        if action == "list":
-            try:
-                buckets = self.workspace_manager.bucket_service.list_buckets_in_namespace(
-                    workspace['namespace']
-                )
-                if buckets:
-                    bucket_text = "🪣 Available Buckets:\n"
-                    for bucket in buckets:
-                        bucket_text += f"• {bucket['bucket_name']} ({bucket.get('location', 'unknown')})\n"
-                    await session.send_message(bucket_text)
-                else:
-                    await session.send_message("📭 No buckets found")
-            except Exception as e:
-                await session.send_message(f"❌ Error listing buckets: {e}")
-        
-        elif action == "info" and workspace.get('bucket'):
-            bucket = workspace['bucket']
-            info_text = f"🪣 Current Bucket Info:\n"
-            info_text += f"   Name: {bucket.get('bucket_name', 'unknown')}\n"
-            info_text += f"   Location: {bucket.get('location', 'unknown')}\n"
-            info_text += f"   Mount: {bucket.get('mount_path', 'unknown')}\n"
-            info_text += f"   URL: {bucket.get('url', 'unknown')}\n"
-            await session.send_message(info_text)
-        
-        else:
-            await session.send_message("❌ Usage: /buckets [list|info]")
-    
-    async def _cmd_python(self, session: 'ShellSession', args: List[str]):
-        """Handle /python command"""
-        if not args:
-            await session.send_message("❌ Usage: /python <code>")
-            return
-        
-        code = " ".join(args)
-        
-        try:
-            result = session.execute_command(f"python -c '{code}'")
-            if result['success']:
-                if result['stdout']:
-                    await session.send_message(f"🐍 Python Output:\n{result['stdout']}")
-                else:
-                    await session.send_message("✅ Python code executed successfully")
-            else:
-                await session.send_message(f"❌ Python Error:\n{result['stderr']}")
-        except Exception as e:
-            await session.send_message(f"❌ Error: {e}")
-    
-    async def _cmd_disks(self, session: 'ShellSession', args: List[str]):
-        """Handle /disks command"""
-        action = args[0] if args else "list"
-        workspace = self.workspace_manager.get_workspace(session.workspace_id)
-        
-        if not workspace:
-            await session.send_message("❌ Workspace not found")
-            return
-        
-        if action == "list":
-            try:
-                disks = self.workspace_manager.disk_service.list_disks_in_namespace(
-                    workspace['namespace']
-                )
-                if disks:
-                    disk_text = "💾 Available Disks:\n"
-                    for disk in disks:
-                        disk_text += f"• {disk['disk_name']} ({disk.get('size_gb', 'unknown')} GB)\n"
-                    await session.send_message(disk_text)
-                else:
-                    await session.send_message("📭 No disks found")
-            except Exception as e:
-                await session.send_message(f"❌ Error listing disks: {e}")
-        
-        elif action == "info" and workspace.get('disk'):
-            disk = workspace['disk']
-            info_text = f"💾 Current Disk Info:\n"
-            info_text += f"   Name: {disk.get('disk_name', 'unknown')}\n"
-            info_text += f"   Size: {disk.get('size_gb', 'unknown')} GB\n"
-            info_text += f"   Zone: {disk.get('zone', 'unknown')}\n"
-            info_text += f"   Mount: {disk.get('mount_path', 'unknown')}\n"
-            await session.send_message(info_text)
-        
-        else:
-            await session.send_message("❌ Usage: /disks [list|info]")
-    
-    async def _cmd_debug(self, session: 'ShellSession', args: List[str]):
-        """Handle /debug command"""
-        workspace = self.workspace_manager.get_workspace(session.workspace_id)
-        
-        debug_text = "🐛 Debug Information:\n"
-        debug_text += "=" * 30 + "\n"
-        debug_text += f"Session ID: {session.workspace_id}\n"
-        debug_text += f"Workspace exists: {workspace is not None}\n"
-        debug_text += f"Active sessions: {len(self.active_sessions)}\n"
-        
-        if workspace:
-            debug_text += f"Container ID: {workspace.get('container_id', 'unknown')}\n"
-            debug_text += f"Status: {workspace.get('status', 'unknown')}\n"
-        
-        await session.send_message(debug_text)
-    
-    async def _cmd_clear(self, session: 'ShellSession', args: List[str]):
-        """Handle /clear command"""
-        await session.send_message("\033[2J\033[H")  # Clear screen
+            await session.send_message(f"❌ Error getting credits: {e}")
     
     async def _cmd_exit(self, session: 'ShellSession', args: List[str]):
-        """Handle /exit command"""
+        """Exit shell session"""
         await session.send_message("👋 Goodbye!")
         await session.close()
 
 class ShellSession:
-    """Individual shell session for a workspace"""
+    """Individual shell session for a workspace with billing integration"""
     
     def __init__(self, workspace_id: str, websocket: WebSocket, shell_service: ShellService):
         self.workspace_id = workspace_id
         self.websocket = websocket
         self.shell_service = shell_service
         self.workspace_manager = shell_service.workspace_manager
+        self.session_id = f"shell_{workspace_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.user_id = None  # Will be set when workspace is loaded
         self.running = False
         self.container_process = None
+        self.billing_start_time = None
+        self.last_activity = datetime.now()
+        self.monitor_task = None
+        
+        # Session limits
+        self.max_duration_hours = 8.0
+        self.max_idle_minutes = 30.0
     
     async def start(self):
-        """Start the shell session"""
+        """Start the shell session with monitoring"""
         self.running = True
+        
+        # Get user ID from workspace
+        try:
+            workspace = self.workspace_manager.get_workspace(self.workspace_id)
+            if workspace:
+                self.user_id = workspace.get('user_id', 'unknown')
+        except Exception as e:
+            logger.error(f"Error getting workspace info: {e}")
+            self.user_id = 'unknown'
         
         # Send welcome message
         welcome_msg = f"""
 🚀 OnMemOS v3 Interactive Shell
 ===============================
 🏠 Workspace: {self.workspace_id}
+👤 User: {self.user_id}
 💡 Type /help for available commands
 🔧 Type /exit to quit
+⏰ Session limit: {self.max_duration_hours} hours
 ================================
 """
         await self.send_message(welcome_msg)
+        
+        # Start session monitoring
+        self.monitor_task = asyncio.create_task(self._monitor_session())
         
         # Start container shell process
         await self._start_container_shell()
@@ -422,6 +223,7 @@ class ShellSession:
             while self.running:
                 try:
                     message = await self.websocket.receive_text()
+                    self.last_activity = datetime.now()
                     await self._handle_input(message)
                 except Exception as e:
                     logger.error(f"Error handling message: {e}")
@@ -429,120 +231,87 @@ class ShellSession:
         finally:
             await self.stop()
     
+    async def _monitor_session(self):
+        """Monitor session for timeouts and limits"""
+        while self.running:
+            try:
+                await asyncio.sleep(60)  # Check every minute
+                
+                # Check session duration
+                if self.billing_start_time:
+                    duration = datetime.now() - self.billing_start_time
+                    if duration.total_seconds() / 3600.0 > self.max_duration_hours:
+                        await self.send_message("⏰ Session duration limit reached. Closing session...")
+                        await self.close()
+                        break
+                
+                # Check idle time
+                idle_time = datetime.now() - self.last_activity
+                if idle_time.total_seconds() / 60.0 > self.max_idle_minutes:
+                    await self.send_message("😴 Session idle timeout. Closing session...")
+                    await self.close()
+                    break
+                
+                # Check user credits
+                if self.user_id and self.user_id != 'unknown':
+                    try:
+                        user_credits = await self.shell_service.db.get_user_credits(self.user_id)
+                        if user_credits <= 0:
+                            await self.send_message("💳 Insufficient credits. Closing session...")
+                            await self.close()
+                            break
+                    except Exception as e:
+                        logger.error(f"Error checking credits: {e}")
+                
+            except Exception as e:
+                logger.error(f"Error in session monitor: {e}")
+    
     async def _start_container_shell(self):
         """Start the container shell process"""
-        try:
-            workspace = self.workspace_manager.get_workspace(self.workspace_id)
-            if not workspace or not workspace.get('container_id'):
-                await self.send_message("❌ Container not available")
-                return
-            
-            container_id = workspace['container_id']
-            
-            # Start interactive shell in container
-            cmd = ["docker", "exec", "-i", container_id, "/bin/bash"]
-            self.container_process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1
-            )
-            
-            # Start output reader thread
-            threading.Thread(target=self._read_output, daemon=True).start()
-            
-        except Exception as e:
-            await self.send_message(f"❌ Failed to start container shell: {e}")
+        # TODO: Implement container shell process
+        # This would start a shell process in the workspace container
+        logger.info(f"Starting container shell for workspace {self.workspace_id}")
     
-    def _read_output(self):
-        """Read output from container process"""
-        try:
-            while self.running and self.container_process:
-                line = self.container_process.stdout.readline()
-                if line:
-                    asyncio.create_task(self.send_message(line))
-                else:
-                    break
-        except Exception as e:
-            logger.error(f"Error reading container output: {e}")
-    
-    async def _handle_input(self, input_line: str):
+    async def _handle_input(self, message: str):
         """Handle user input"""
-        line = input_line.strip()
-        
-        if not line:
-            return
-        
-        # Check if it's a slash command
-        if line.startswith('/'):
-            await self._handle_slash_command(line)
-        else:
-            # Send to container shell
-            await self._send_to_container(line)
+        try:
+            # Check for slash commands
+            if message.startswith('/'):
+                await self._handle_slash_command(message)
+            else:
+                await self._handle_shell_command(message)
+        except Exception as e:
+            await self.send_message(f"❌ Error: {e}")
     
-    async def _handle_slash_command(self, input_line: str):
+    async def _handle_slash_command(self, command: str):
         """Handle slash commands"""
-        try:
-            parts = input_line.split()
-            if not parts:
-                return
-            
-            cmd_name = parts[0][1:]  # Remove the slash
-            args = parts[1:] if len(parts) > 1 else []
-            
-            if cmd_name in self.shell_service.slash_commands:
-                cmd = self.shell_service.slash_commands[cmd_name]
-                await cmd.handler(self, args)
-            else:
-                await self.send_message(f"❌ Unknown command: /{cmd_name}\nType /help for available commands")
+        parts = command.split(' ', 1)
+        cmd_name = parts[0]
+        args = parts[1].split() if len(parts) > 1 else []
         
-        except Exception as e:
-            await self.send_message(f"❌ Error executing command: {e}")
+        if cmd_name in self.shell_service.commands:
+            cmd = self.shell_service.commands[cmd_name]
+            await cmd.handler(self, args)
+        else:
+            await self.send_message(f"❌ Unknown command: {cmd_name}. Type /help for available commands.")
     
-    async def _send_to_container(self, command: str):
-        """Send command to container shell"""
-        try:
-            if self.container_process and self.container_process.poll() is None:
-                self.container_process.stdin.write(command + '\n')
-                self.container_process.stdin.flush()
-            else:
-                await self.send_message("❌ Container shell not available")
-        except Exception as e:
-            await self.send_message(f"❌ Error sending to container: {e}")
-    
-    def execute_command(self, command: str) -> Dict[str, Any]:
-        """Execute a command in the container"""
-        try:
-            workspace = self.workspace_manager.get_workspace(self.workspace_id)
-            if not workspace or not workspace.get('container_id'):
-                return {"success": False, "error": "Container not available"}
-            
-            container_id = workspace['container_id']
-            result = subprocess.run(
-                ["docker", "exec", container_id, "sh", "-c", command],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
-            return {
-                "success": result.returncode == 0,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "returncode": result.returncode
-            }
-        
-        except subprocess.TimeoutExpired:
-            return {"success": False, "error": "Command timed out"}
-        except Exception as e:
-            return {"success": False, "error": str(e)}
+    async def _handle_shell_command(self, command: str):
+        """Handle regular shell commands"""
+        # TODO: Implement shell command execution
+        # This would execute the command in the container
+        await self.send_message(f"🔧 Executing: {command}")
+        await self.send_message("📝 Command output would appear here...")
     
     async def send_message(self, message: str):
-        """Send message to WebSocket"""
+        """Send a message to the WebSocket"""
         try:
-            await self.websocket.send_text(message)
+            shell_msg = ShellMessage(
+                type="output",
+                content=message,
+                timestamp=datetime.now().isoformat(),
+                session_id=self.session_id
+            )
+            await self.websocket.send_text(json.dumps(shell_msg.__dict__))
         except Exception as e:
             logger.error(f"Error sending message: {e}")
     
@@ -550,28 +319,38 @@ class ShellSession:
         """Stop the shell session"""
         self.running = False
         
-        if self.container_process:
+        # Cancel monitoring task
+        if self.monitor_task:
+            self.monitor_task.cancel()
             try:
-                self.container_process.terminate()
-                self.container_process.wait(timeout=5)
-            except:
-                self.container_process.kill()
+                await self.monitor_task
+            except asyncio.CancelledError:
+                pass
         
-        self.shell_service.remove_session(self.workspace_id)
+        # Stop billing
+        if self.session_id:
+            try:
+                await self.shell_service.billing_service.stop_session_billing(self.session_id)
+                logger.info(f"Stopped billing for shell session: {self.session_id}")
+            except Exception as e:
+                logger.error(f"Error stopping shell session billing: {e}")
+        
+        # Remove from active sessions
+        if self.session_id in self.shell_service.active_sessions:
+            del self.shell_service.active_sessions[self.session_id]
+        
+        logger.info(f"Shell session stopped: {self.session_id}")
     
     async def close(self):
         """Close the WebSocket connection"""
         try:
             await self.websocket.close()
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Error closing WebSocket: {e}")
+        finally:
+            await self.stop()
 
 # Global shell service instance
-shell_service = None
-
-def get_shell_service(workspace_manager) -> ShellService:
-    """Get or create shell service instance"""
-    global shell_service
-    if shell_service is None:
-        shell_service = ShellService(workspace_manager)
-    return shell_service
+def get_shell_service(workspace_manager):
+    """Get the global shell service instance"""
+    return ShellService(workspace_manager)

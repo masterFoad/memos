@@ -13,9 +13,9 @@ router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 
 
 @router.post("")
-def create_session(payload: Dict[str, Any], _=Depends(require_api_key)):
+async def create_session(payload: Dict[str, Any], _=Depends(require_api_key)):
     try:
-        return sessions_manager.create_session(payload)
+        return await sessions_manager.create_session(payload)
     except Exception as e:
         logger.exception("create_session failed")
         raise HTTPException(500, str(e))
@@ -40,8 +40,8 @@ def get_session(sid: str, _=Depends(require_api_key)):
 
 
 @router.delete("/{sid}")
-def delete_session(sid: str, _=Depends(require_api_key)):
-    ok = sessions_manager.delete_session(sid)
+async def delete_session(sid: str, _=Depends(require_api_key)):
+    ok = await sessions_manager.delete_session(sid)
     if not ok:
         raise HTTPException(404, "Session not found")
     return {"ok": True}

@@ -32,13 +32,57 @@ class SessionsManager:
             return SessionProvider.gke
         return SessionProvider.cloud_run
 
-    def create_session(self, spec: Dict[str, Any]) -> Dict[str, Any]:
+    async def create_session(self, spec: Dict[str, Any]) -> Dict[str, Any]:
         req = CreateSessionRequest(**spec)
+        
+        # Apply template configuration if template_id is provided
+        if req.template_id:
+            await self._apply_template_configuration(req)
+        
         provider = self._choose_provider(req)
         p = self._providers[provider]
-        info = p.create(req)
+        info = await p.create(req)
         self._sessions[info.id] = info
         return info.dict()
+    
+    async def _apply_template_configuration(self, req: CreateSessionRequest):
+        """Apply template configuration to session request"""
+        try:
+            from server.models.session_templates import template_manager
+            
+            # Get template
+            template = template_manager.get_template(req.template_id)
+            if not template:
+                raise ValueError(f"Template {req.template_id} not found")
+            
+            # Apply template configuration
+            req.resource_tier = template.resource_tier
+            req.image_spec = template.image_type
+            req.gpu_spec = template.gpu_type
+            
+            # Apply storage configuration
+            if template.storage_type == "gcs_fuse":
+                req.request_bucket = True
+                req.bucket_size_gb = template.storage_size_gb
+            elif template.storage_type == "persistent_volume":
+                req.request_persistent_storage = True
+                req.persistent_storage_size_gb = template.storage_size_gb
+            
+            # Apply environment variables
+            req.env.update(template.env_vars)
+            
+            # Apply TTL if not explicitly set
+            if req.ttl_minutes == 60:  # Default value
+                req.ttl_minutes = template.default_ttl_minutes
+            
+            # Increment template usage
+            template_manager.increment_usage(req.template_id)
+            
+            logger.info(f"Applied template {req.template_id} to session request")
+            
+        except Exception as e:
+            logger.error(f"Failed to apply template {req.template_id}: {e}")
+            raise ValueError(f"Template configuration failed: {e}")
 
     def list_sessions(self) -> Dict[str, Any]:
         """List all active sessions"""
@@ -61,12 +105,12 @@ class SessionsManager:
         self._sessions[sid] = fresh
         return fresh.dict()
 
-    def delete_session(self, sid: str) -> bool:
+    async def delete_session(self, sid: str) -> bool:
         s = self._sessions.pop(sid, None)
         if not s:
             return False
         p = self._providers[s.provider]
-        return p.delete(s.id)
+        return await p.delete(s.id)
 
     def execute(self, sid: str, command: str, timeout: int = 120, async_execution: bool = False) -> Dict[str, Any]:
         s = self._sessions.get(sid)

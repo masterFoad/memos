@@ -1,0 +1,8 @@
+# Database dependencies for OnMemOS v3
+aiomysql>=0.2.0
+pymysql>=1.1.0
+cryptography>=41.0.0  # For MySQL connection security
+
+# For future Supabase migration
+# supabase>=2.0.0
+# postgrest>=0.13.0

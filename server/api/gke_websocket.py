@@ -174,7 +174,7 @@ async def gke_shell_page(session_id: str, k8s_ns: str, pod: str):
 
 @router.websocket("/shell/{session_id}")
 async def gke_websocket_shell(websocket: WebSocket, session_id: str):
-    """WebSocket endpoint for GKE interactive shell"""
+    """WebSocket endpoint for GKE interactive shell with billing integration"""
     await websocket.accept()
     
     try:
@@ -186,8 +186,19 @@ async def gke_websocket_shell(websocket: WebSocket, session_id: str):
             await websocket.close(code=1008, reason="Missing k8s_ns or pod parameters")
             return
         
-        # Handle WebSocket connection
-        await gke_shell_service.handle_websocket(websocket, session_id, k8s_ns, pod)
+        # Get user_id from session (for billing integration)
+        user_id = None
+        try:
+            from server.services.sessions.manager import sessions_manager
+            session_info = sessions_manager.get_session(session_id)
+            if session_info:
+                user_id = session_info.get("user")
+                logger.info(f"Found user {user_id} for session {session_id}")
+        except Exception as e:
+            logger.warning(f"Could not get user_id for session {session_id}: {e}")
+        
+        # Handle WebSocket connection with billing
+        await gke_shell_service.handle_websocket(websocket, session_id, k8s_ns, pod, user_id)
         
     except WebSocketDisconnect:
         websocket_logger.info(f"WebSocket disconnected: {session_id}")
