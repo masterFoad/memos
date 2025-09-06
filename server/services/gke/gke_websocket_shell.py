@@ -5,14 +5,21 @@ Based on imru_official implementation, adapted for OnMemOS v3
 
 import asyncio
 import json
+import os
 import shlex
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List, Callable
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from enum import Enum
+
 from fastapi import WebSocket
-from websockets.exceptions import ConnectionClosed
+from starlette.websockets import WebSocketDisconnect  # Correct exception for FastAPI
+try:
+    # Optional: tolerate environments that use websockets lib directly
+    from websockets.exceptions import ConnectionClosed as WSConnectionClosed
+except Exception:  # pragma: no cover
+    WSConnectionClosed = tuple()  # harmless fallback
 
 from server.core.logging import get_websocket_logger, get_gke_logger
 from .gke_service import gke_service
@@ -22,14 +29,19 @@ from server.services.billing_service import BillingService
 websocket_logger = get_websocket_logger()
 gke_logger = get_gke_logger()
 
+# Optional safety: cap per-message stdout size (default unlimited)
+MAX_OUT_BYTES = int(os.getenv("GKE_SHELL_MAX_OUTPUT_BYTES", "0")) or None
+
+
 class ShellCommandType(Enum):
     """Types of shell commands"""
-    SYSTEM = "system"      # /help, /status, /clear
-    WORKSPACE = "workspace"  # /upload, /download, /list
-    FILE = "file"          # /cat, /edit, /rm
-    PROCESS = "process"    # /ps, /kill, /top
-    NETWORK = "network"    # /curl, /ping, /netstat
-    CUSTOM = "custom"      # User-defined commands
+    SYSTEM = "system"       # /help, /status, /clear, /env, /df, /credits
+    WORKSPACE = "workspace" # /upload, /download, /list, /pwd, /ls
+    FILE = "file"           # /cat, /edit, /rm
+    PROCESS = "process"     # /ps, /kill, /top
+    NETWORK = "network"     # /curl, /ping, /netstat
+    CUSTOM = "custom"       # User-defined commands
+
 
 @dataclass
 class ShellCommand:
@@ -42,14 +54,29 @@ class ShellCommand:
     requires_auth: bool = True
     admin_only: bool = False
 
+
 @dataclass
 class ShellResponse:
     """Standardized shell response"""
-    type: str  # "output", "error", "info", "warning", "success"
+    type: str  # "output", "error", "info", "warning", "success", "clear", "prompt"
     content: str
     timestamp: str
     command_id: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+
+
+def _clamp_text(s: str) -> str:
+    """Optionally clamp large outputs to protect the websocket client."""
+    if MAX_OUT_BYTES is None or s is None:
+        return s
+    if len(s.encode("utf-8", errors="ignore")) <= MAX_OUT_BYTES:
+        return s
+    # Trim by characters (approximate), then ensure byte bound
+    approx = s[:MAX_OUT_BYTES]
+    while len(approx.encode("utf-8", errors="ignore")) > MAX_OUT_BYTES and approx:
+        approx = approx[:-1]
+    return approx + "\n\n[output truncated]\n"
+
 
 class GKEShellSession:
     """Individual WebSocket session for GKE interactive shell with billing integration"""
@@ -85,28 +112,24 @@ class GKEShellSession:
             # Initialize billing services
             await self._init_billing()
             
-            # Check if we should be quiet (for testing)
+            # Quiet mode?
             quiet = False
             try:
-                # Try to get quiet parameter from query string
                 if hasattr(self.websocket, 'query_params'):
                     quiet = self.websocket.query_params.get('quiet', '0') == '1'
-            except:
+            except Exception:
                 pass
             
             if not quiet:
-                # Send welcome message
                 await self.send_response(ShellResponse(
                     type="info",
                     content="🚀 Welcome to OnMemOS GKE Interactive Shell!\nType /help for available commands.",
                     timestamp=datetime.now(timezone.utc).isoformat()
                 ))
                 
-                # Send billing info
                 if self.user_id:
                     await self._send_billing_info()
                 
-                # Send prompt
                 await self._send_prompt()
             
             # Main message loop
@@ -114,18 +137,14 @@ class GKEShellSession:
                 try:
                     message = await self.websocket.receive_text()
                     await self._handle_message(message)
-                except ConnectionClosed as e:
-                    # Normal WebSocket closure - not an error
-                    if e.code == 1000:
-                        websocket_logger.debug(f"WebSocket connection closed normally: {e}")
-                    else:
-                        websocket_logger.info(f"WebSocket connection closed with code {e.code}: {e}")
+                except (WebSocketDisconnect, WSConnectionClosed):
+                    websocket_logger.info(f"WebSocket disconnected for session {self.session_id}")
                     break
                 except Exception as e:
                     websocket_logger.error(f"Error receiving message: {e}")
                     break
                 
-        except ConnectionClosed:
+        except (WebSocketDisconnect, WSConnectionClosed):
             websocket_logger.info(f"WebSocket connection closed for session {self.session_id}")
         except Exception as e:
             websocket_logger.error(f"Session error: {e}")
@@ -182,7 +201,7 @@ class GKEShellSession:
         if len(self.command_history) > self.max_history:
             self.command_history.pop(0)
         
-        # Check if it's a slash command
+        # Slash command?
         if command.startswith('/'):
             await self._handle_slash_command(command)
         else:
@@ -191,26 +210,23 @@ class GKEShellSession:
     async def _handle_slash_command(self, command: str):
         """Handle slash commands"""
         try:
-            # Parse command
             parts = shlex.split(command)
             cmd_name = parts[0]
             args = parts[1:] if len(parts) > 1 else []
             
-            # Find command handler
             if cmd_name in self.shell_service.commands:
                 cmd = self.shell_service.commands[cmd_name]
-                
-                # Execute command
                 response = await cmd.handler(self, args)
+                # Clamp outputs if needed
+                if response and response.content:
+                    response.content = _clamp_text(response.content)
                 await self.send_response(response)
-                
             else:
                 await self.send_response(ShellResponse(
                     type="error",
                     content=f"Unknown command: {cmd_name}. Type /help for available commands.",
                     timestamp=datetime.now(timezone.utc).isoformat()
                 ))
-                
         except Exception as e:
             websocket_logger.error(f"Command error: {str(e)}")
             await self.send_response(ShellResponse(
@@ -224,13 +240,10 @@ class GKEShellSession:
     async def _handle_shell_command(self, command: str):
         """Handle regular shell commands with credit checking"""
         try:
-            # Check credits before executing command
             if not await self._check_credits():
-                # Terminate session if no credits
                 await self.close()
                 return
             
-            # Execute command in pod using gke_service
             result = gke_service.exec_in_workspace(
                 workspace_id=self.session_id,
                 k8s_ns=self.k8s_ns,
@@ -240,22 +253,23 @@ class GKEShellSession:
             )
             
             if result["success"]:
+                out = _clamp_text(result.get("stdout", ""))
                 await self.send_response(ShellResponse(
                     type="output",
-                    content=result["stdout"],
+                    content=out,
                     timestamp=datetime.now(timezone.utc).isoformat()
                 ))
                 
-                if result["stderr"]:
+                if result.get("stderr"):
                     await self.send_response(ShellResponse(
                         type="warning",
-                        content=f"stderr: {result['stderr']}",
+                        content=_clamp_text(f"stderr: {result['stderr']}"),
                         timestamp=datetime.now(timezone.utc).isoformat()
                     ))
             else:
                 await self.send_response(ShellResponse(
                     type="error",
-                    content=f"Command failed (rc={result['returncode']}): {result['stderr']}",
+                    content=_clamp_text(f"Command failed (rc={result['returncode']}): {result.get('stderr','')}"),
                     timestamp=datetime.now(timezone.utc).isoformat()
                 ))
             
@@ -273,20 +287,17 @@ class GKEShellSession:
         """Initialize billing services and start session billing"""
         try:
             if self.user_id:
-                # Initialize database and billing service
                 self.db = get_database_client()
                 await self.db.connect()
                 self.billing_service = BillingService()
                 
-                # Start session billing
-                billing_info = await self.billing_service.start_session_billing(
+                await self.billing_service.start_session_billing(
                     self.session_id, 
                     self.user_id, 
                     "gke_shell"  # Special tier for GKE shell sessions
                 )
                 self.billing_start_time = datetime.now(timezone.utc)
                 websocket_logger.info(f"Started GKE shell billing: {self.session_id} for user {self.user_id}")
-                
         except Exception as e:
             websocket_logger.error(f"Failed to initialize billing for session {self.session_id}: {e}")
     
@@ -328,23 +339,21 @@ class GKEShellSession:
         }))
     
     async def _handle_resize(self, cols: int, rows: int):
-        """Handle terminal resize"""
+        """Handle terminal resize (best-effort; may be no-tty)"""
         try:
-            # Set terminal size in pod
             gke_service.exec_in_workspace(
                 workspace_id=self.session_id,
                 k8s_ns=self.k8s_ns,
                 pod=self.pod_name,
-                command=f"stty cols {cols} rows {rows}",
+                command=f"stty cols {int(cols)} rows {int(rows)}",
                 timeout=30
             )
         except Exception as e:
-            websocket_logger.warning(f"Failed to resize terminal: {e}")
+            websocket_logger.debug(f"Resize ignored (no TTY or stty): {e}")
     
     async def _send_prompt(self):
         """Send shell prompt"""
         try:
-            # Get current working directory
             pwd_result = gke_service.exec_in_workspace(
                 workspace_id=self.session_id,
                 k8s_ns=self.k8s_ns,
@@ -352,8 +361,6 @@ class GKEShellSession:
                 command="pwd",
                 timeout=30
             )
-            
-            # Get username
             user_result = gke_service.exec_in_workspace(
                 workspace_id=self.session_id,
                 k8s_ns=self.k8s_ns,
@@ -361,16 +368,13 @@ class GKEShellSession:
                 command="whoami",
                 timeout=30
             )
-            
-            if pwd_result["success"] and user_result["success"]:
-                pwd = pwd_result["stdout"].strip()
-                user = user_result["stdout"].strip()
-                prompt = f"{user}@{self.pod_name}:{pwd}$ "
+            if pwd_result.get("success") and user_result.get("success"):
+                pwd = (pwd_result.get("stdout") or "").strip()
+                user = (user_result.get("stdout") or "").strip()
+                prompt = f"{user or 'root'}@{self.pod_name}:{pwd or '/'}$ "
             else:
                 prompt = f"root@{self.pod_name}:/$ "
-            
-        except Exception as e:
-            # Fallback prompt
+        except Exception:
             prompt = f"root@{self.pod_name}:/$ "
         
         await self.send_response(ShellResponse(
@@ -384,15 +388,14 @@ class GKEShellSession:
         self.is_running = False
         
         try:
-            # Stop billing
             if self.billing_service and self.session_id:
                 final_billing = await self.billing_service.stop_session_billing(self.session_id)
                 if final_billing:
                     total_cost = final_billing.get('total_cost', 0)
                     total_hours = final_billing.get('total_hours', 0)
-                    websocket_logger.info(f"GKE shell session {self.session_id} billing completed: {total_hours:.2f} hours = ${total_cost:.4f}")
-                    
-                    # Deduct credits from user account
+                    websocket_logger.info(
+                        f"GKE shell session {self.session_id} billing completed: {total_hours:.2f} hours = ${total_cost:.4f}"
+                    )
                     if total_cost > 0 and self.user_id and self.db:
                         await self.db.deduct_credits(
                             self.user_id, 
@@ -400,7 +403,9 @@ class GKEShellSession:
                             f"GKE shell session {self.session_id} runtime",
                             session_id=self.session_id
                         )
-                        websocket_logger.info(f"Deducted ${total_cost:.4f} from user {self.user_id} for GKE shell session {self.session_id}")
+                        websocket_logger.info(
+                            f"Deducted ${total_cost:.4f} from user {self.user_id} for GKE shell session {self.session_id}"
+                        )
         except Exception as e:
             websocket_logger.error(f"Failed to cleanup billing for GKE shell session {self.session_id}: {e}")
         
@@ -419,23 +424,25 @@ class GKEShellSession:
                 "timestamp": response.timestamp,
                 "session_id": self.session_id
             }
-            
             if response.command_id:
                 message["command_id"] = response.command_id
-            
             if response.metadata:
                 message["metadata"] = response.metadata
-            
             await self.websocket.send_text(json.dumps(message))
-            
         except Exception as e:
             websocket_logger.error(f"Failed to send response: {e}")
     
     async def cleanup(self):
         """Clean up session resources"""
         try:
-            # Keep pod running for now
-            pass
+            # DB disconnect (avoid leaks)
+            if self.db:
+                try:
+                    await self.db.disconnect()
+                except Exception as e:
+                    websocket_logger.debug(f"DB disconnect warning: {e}")
+                finally:
+                    self.db = None
         except Exception as e:
             websocket_logger.error(f"Cleanup error: {e}")
     
@@ -451,6 +458,7 @@ class GKEShellSession:
             "is_running": self.is_running
         }
 
+
 class GKEShellService:
     """WebSocket-based interactive shell service for GKE"""
     
@@ -461,131 +469,70 @@ class GKEShellService:
     
     def _register_default_commands(self):
         """Register default slash commands"""
-        
-        # System commands
         self.register_command(ShellCommand(
-            name="help",
-            description="Show available commands",
-            usage="/help [category]",
-            category=ShellCommandType.SYSTEM,
-            handler=self._cmd_help
+            name="help", description="Show available commands", usage="/help [category]",
+            category=ShellCommandType.SYSTEM, handler=self._cmd_help
         ))
-        
         self.register_command(ShellCommand(
-            name="status",
-            description="Show workspace status",
-            usage="/status",
-            category=ShellCommandType.SYSTEM,
-            handler=self._cmd_status
+            name="status", description="Show workspace status", usage="/status",
+            category=ShellCommandType.SYSTEM, handler=self._cmd_status
         ))
-        
         self.register_command(ShellCommand(
-            name="credits",
-            description="Show current credit balance",
-            usage="/credits",
-            category=ShellCommandType.SYSTEM,
-            handler=self._cmd_credits
+            name="credits", description="Show current credit balance", usage="/credits",
+            category=ShellCommandType.SYSTEM, handler=self._cmd_credits
         ))
-        
         self.register_command(ShellCommand(
-            name="clear",
-            description="Clear terminal",
-            usage="/clear",
-            category=ShellCommandType.SYSTEM,
-            handler=self._cmd_clear
+            name="clear", description="Clear terminal", usage="/clear",
+            category=ShellCommandType.SYSTEM, handler=self._cmd_clear
         ))
-        
-        # Workspace commands
+        # Workspace
         self.register_command(ShellCommand(
-            name="list",
-            description="List workspace files",
-            usage="/list [path]",
-            category=ShellCommandType.WORKSPACE,
-            handler=self._cmd_list
+            name="list", description="List workspace files", usage="/list [path]",
+            category=ShellCommandType.WORKSPACE, handler=self._cmd_list
         ))
-        
         self.register_command(ShellCommand(
-            name="pwd",
-            description="Show current directory",
-            usage="/pwd",
-            category=ShellCommandType.WORKSPACE,
-            handler=self._cmd_pwd
+            name="pwd", description="Show current directory", usage="/pwd",
+            category=ShellCommandType.WORKSPACE, handler=self._cmd_pwd
         ))
-        
         self.register_command(ShellCommand(
-            name="ls",
-            description="List directory contents",
-            usage="/ls [path]",
-            category=ShellCommandType.WORKSPACE,
-            handler=self._cmd_ls
+            name="ls", description="List directory contents", usage="/ls [path]",
+            category=ShellCommandType.WORKSPACE, handler=self._cmd_ls
         ))
-        
-        # File commands
+        # File
         self.register_command(ShellCommand(
-            name="cat",
-            description="Display file contents",
-            usage="/cat <file_path>",
-            category=ShellCommandType.FILE,
-            handler=self._cmd_cat
+            name="cat", description="Display file contents", usage="/cat <file_path>",
+            category=ShellCommandType.FILE, handler=self._cmd_cat
         ))
-        
         self.register_command(ShellCommand(
-            name="rm",
-            description="Remove file or directory",
-            usage="/rm <path>",
-            category=ShellCommandType.FILE,
-            handler=self._cmd_rm
+            name="rm", description="Remove file or directory", usage="/rm <path>",
+            category=ShellCommandType.FILE, handler=self._cmd_rm
         ))
-        
-        # Process commands
+        # Process
         self.register_command(ShellCommand(
-            name="ps",
-            description="List running processes",
-            usage="/ps",
-            category=ShellCommandType.PROCESS,
-            handler=self._cmd_ps
+            name="ps", description="List running processes", usage="/ps",
+            category=ShellCommandType.PROCESS, handler=self._cmd_ps
         ))
-        
         self.register_command(ShellCommand(
-            name="kill",
-            description="Kill process",
-            usage="/kill <pid>",
-            category=ShellCommandType.PROCESS,
-            handler=self._cmd_kill
+            name="kill", description="Kill process", usage="/kill <pid>",
+            category=ShellCommandType.PROCESS, handler=self._cmd_kill
         ))
-        
-        # Network commands
+        # Network
         self.register_command(ShellCommand(
-            name="curl",
-            description="Make HTTP request",
-            usage="/curl <url> [options]",
-            category=ShellCommandType.NETWORK,
-            handler=self._cmd_curl
+            name="curl", description="Make HTTP request", usage="/curl <url> [options]",
+            category=ShellCommandType.NETWORK, handler=self._cmd_curl
         ))
-        
         self.register_command(ShellCommand(
-            name="ping",
-            description="Ping host",
-            usage="/ping <host>",
-            category=ShellCommandType.NETWORK,
-            handler=self._cmd_ping
+            name="ping", description="Ping host", usage="/ping <host>",
+            category=ShellCommandType.NETWORK, handler=self._cmd_ping
         ))
-        
-        # Environment commands
+        # Env/system
         self.register_command(ShellCommand(
-            name="env",
-            description="Show environment variables",
-            usage="/env",
-            category=ShellCommandType.SYSTEM,
-            handler=self._cmd_env
+            name="env", description="Show environment variables", usage="/env",
+            category=ShellCommandType.SYSTEM, handler=self._cmd_env
         ))
-        
         self.register_command(ShellCommand(
-            name="df",
-            description="Show disk usage",
-            usage="/df",
-            category=ShellCommandType.SYSTEM,
-            handler=self._cmd_df
+            name="df", description="Show disk usage", usage="/df",
+            category=ShellCommandType.SYSTEM, handler=self._cmd_df
         ))
     
     def register_command(self, command: ShellCommand):
@@ -595,56 +542,60 @@ class GKEShellService:
     
     async def handle_websocket(self, websocket: WebSocket, session_id: str, k8s_ns: str, pod_name: str, user_id: str = None):
         """Handle WebSocket connection for interactive shell with billing integration"""
-        
         try:
-            # Normalize k8s namespace to include the prefix
+            # Normalize k8s namespace using the actual service prefix
             try:
-                ns_prefix = "onmemos"
+                ns_prefix = getattr(gke_service, "namespace_prefix", "onmemos")
                 if not k8s_ns.startswith(f"{ns_prefix}-"):
                     k8s_ns = f"{ns_prefix}-{k8s_ns}"
             except Exception:
                 pass
             
-            # Create shell session with user_id for billing
             session = GKEShellSession(websocket, session_id, k8s_ns, pod_name, self, user_id)
             self.active_sessions[session_id] = session
             
-            websocket_logger.info(f"GKE shell session started: {session_id} for pod {pod_name} in {k8s_ns} (user: {user_id})")
+            websocket_logger.info(
+                f"GKE shell session started: {session_id} for pod {pod_name} in {k8s_ns} (user: {user_id})"
+            )
             
-            # Handle shell interaction
             await session.run()
-            
         except Exception as e:
             websocket_logger.error(f"GKE shell session error: {e}")
         finally:
             if session_id in self.active_sessions:
-                await self.active_sessions[session_id].cleanup()
+                try:
+                    await self.active_sessions[session_id].cleanup()
+                except Exception as e:
+                    websocket_logger.debug(f"Cleanup warning for session {session_id}: {e}")
                 del self.active_sessions[session_id]
     
-    # Command handlers
+    # ------------------ Command handlers ------------------ #
+
     async def _cmd_help(self, session: GKEShellSession, args: List[str]) -> ShellResponse:
         """Handle /help command"""
         if args:
-            category = args[0].upper()
+            raw = args[0]
+            # Accept either enum name or value, any case
             try:
-                category_enum = ShellCommandType(category)
-                commands = [cmd for cmd in self.commands.values() if cmd.category == category_enum]
-            except ValueError:
-                return ShellResponse("error", f"Unknown category: {category}", datetime.now(timezone.utc).isoformat())
+                category_enum = ShellCommandType[raw.upper()]
+            except KeyError:
+                try:
+                    category_enum = ShellCommandType(raw.lower())
+                except ValueError:
+                    return ShellResponse("error", f"Unknown category: {raw}", datetime.now(timezone.utc).isoformat())
+            commands = [cmd for cmd in self.commands.values() if cmd.category == category_enum]
         else:
             commands = list(self.commands.values())
         
-        help_text = "📚 Available Commands:\n\n"
+        help_lines = ["📚 Available Commands:\n"]
         for cmd in commands:
-            help_text += f"🔹 {cmd.name}: {cmd.description}\n"
-            help_text += f"   Usage: {cmd.usage}\n\n"
-        
-        return ShellResponse("info", help_text, datetime.now(timezone.utc).isoformat())
+            help_lines.append(f"🔹 {cmd.name}: {cmd.description}")
+            help_lines.append(f"   Usage: {cmd.usage}\n")
+        return ShellResponse("info", "\n".join(help_lines), datetime.now(timezone.utc).isoformat())
     
     async def _cmd_status(self, session: GKEShellSession, args: List[str]) -> ShellResponse:
         """Handle /status command"""
         try:
-            # Get pod status
             result = gke_service.exec_in_workspace(
                 workspace_id=session.session_id,
                 k8s_ns=session.k8s_ns,
@@ -652,15 +603,15 @@ class GKEShellService:
                 command="echo 'Pod is running'",
                 timeout=30
             )
-            
-            status_text = f"📊 GKE Pod Status:\n"
-            status_text += f"🔹 Session ID: {session.session_id}\n"
-            status_text += f"🔹 Namespace: {session.k8s_ns}\n"
-            status_text += f"🔹 Pod: {session.pod_name}\n"
-            status_text += f"🔹 Status: {'Running' if result['success'] else 'Error'}\n"
-            status_text += f"🔹 Connected: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
-            status_text += f"🔹 Commands executed: {session.command_count}\n"
-            
+            status_text = (
+                "📊 GKE Pod Status:\n"
+                f"🔹 Session ID: {session.session_id}\n"
+                f"🔹 Namespace: {session.k8s_ns}\n"
+                f"🔹 Pod: {session.pod_name}\n"
+                f"🔹 Status: {'Running' if result.get('success') else 'Error'}\n"
+                f"🔹 Connected: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                f"🔹 Commands executed: {session.command_count}\n"
+            )
             return ShellResponse("info", status_text, datetime.now(timezone.utc).isoformat())
         except Exception as e:
             return ShellResponse("error", f"Failed to get status: {str(e)}", datetime.now(timezone.utc).isoformat())
@@ -670,17 +621,16 @@ class GKEShellService:
         try:
             if session.user_id and session.db:
                 current_credits = await session.db.get_user_credits(session.user_id)
-                credits_text = f"💳 Credit Balance:\n"
-                credits_text += f"🔹 User: {session.user_id}\n"
-                credits_text += f"🔹 Current Credits: ${current_credits:.2f}\n"
-                credits_text += f"🔹 Session ID: {session.session_id}\n"
-                
-                # Add billing info if available
+                credits_text = (
+                    "💳 Credit Balance:\n"
+                    f"🔹 User: {session.user_id}\n"
+                    f"🔹 Current Credits: ${current_credits:.2f}\n"
+                    f"🔹 Session ID: {session.session_id}\n"
+                )
                 if session.billing_start_time:
                     duration = datetime.now(timezone.utc) - session.billing_start_time
                     hours = duration.total_seconds() / 3600.0
                     credits_text += f"🔹 Session Duration: {hours:.2f} hours\n"
-                
                 return ShellResponse("info", credits_text, datetime.now(timezone.utc).isoformat())
             else:
                 return ShellResponse("warning", "Billing not available for this session", datetime.now(timezone.utc).isoformat())
@@ -694,20 +644,14 @@ class GKEShellService:
     async def _cmd_list(self, session: GKEShellSession, args: List[str]) -> ShellResponse:
         """Handle /list command"""
         path = args[0] if args else "/workspace"
-        
         try:
             result = gke_service.exec_in_workspace(
-                workspace_id=session.session_id,
-                k8s_ns=session.k8s_ns,
-                pod=session.pod_name,
-                command=f"ls -la {shlex.quote(path)}",
-                timeout=60
+                workspace_id=session.session_id, k8s_ns=session.k8s_ns, pod=session.pod_name,
+                command=f"ls -la {shlex.quote(path)}", timeout=60
             )
-            
-            if result["success"]:
-                return ShellResponse("output", result["stdout"], datetime.now(timezone.utc).isoformat())
-            else:
-                return ShellResponse("error", f"List failed: {result['stderr']}", datetime.now(timezone.utc).isoformat())
+            if result.get("success"):
+                return ShellResponse("output", _clamp_text(result.get("stdout", "")), datetime.now(timezone.utc).isoformat())
+            return ShellResponse("error", f"List failed: {result.get('stderr','')}", datetime.now(timezone.utc).isoformat())
         except Exception as e:
             return ShellResponse("error", f"List failed: {str(e)}", datetime.now(timezone.utc).isoformat())
     
@@ -715,37 +659,26 @@ class GKEShellService:
         """Handle /pwd command"""
         try:
             result = gke_service.exec_in_workspace(
-                workspace_id=session.session_id,
-                k8s_ns=session.k8s_ns,
-                pod=session.pod_name,
-                command="pwd",
-                timeout=30
+                workspace_id=session.session_id, k8s_ns=session.k8s_ns, pod=session.pod_name,
+                command="pwd", timeout=30
             )
-            
-            if result["success"]:
-                return ShellResponse("output", result["stdout"], datetime.now(timezone.utc).isoformat())
-            else:
-                return ShellResponse("error", f"PWD failed: {result['stderr']}", datetime.now(timezone.utc).isoformat())
+            if result.get("success"):
+                return ShellResponse("output", result.get("stdout",""), datetime.now(timezone.utc).isoformat())
+            return ShellResponse("error", f"PWD failed: {result.get('stderr','')}", datetime.now(timezone.utc).isoformat())
         except Exception as e:
             return ShellResponse("error", f"PWD failed: {str(e)}", datetime.now(timezone.utc).isoformat())
     
     async def _cmd_ls(self, session: GKEShellSession, args: List[str]) -> ShellResponse:
         """Handle /ls command"""
         path = args[0] if args else "."
-        
         try:
             result = gke_service.exec_in_workspace(
-                workspace_id=session.session_id,
-                k8s_ns=session.k8s_ns,
-                pod=session.pod_name,
-                command=f"ls -la {shlex.quote(path)}",
-                timeout=60
+                workspace_id=session.session_id, k8s_ns=session.k8s_ns, pod=session.pod_name,
+                command=f"ls -la {shlex.quote(path)}", timeout=60
             )
-            
-            if result["success"]:
-                return ShellResponse("output", result["stdout"], datetime.now(timezone.utc).isoformat())
-            else:
-                return ShellResponse("error", f"LS failed: {result['stderr']}", datetime.now(timezone.utc).isoformat())
+            if result.get("success"):
+                return ShellResponse("output", _clamp_text(result.get("stdout","")), datetime.now(timezone.utc).isoformat())
+            return ShellResponse("error", f"LS failed: {result.get('stderr','')}", datetime.now(timezone.utc).isoformat())
         except Exception as e:
             return ShellResponse("error", f"LS failed: {str(e)}", datetime.now(timezone.utc).isoformat())
     
@@ -753,22 +686,15 @@ class GKEShellService:
         """Handle /cat command"""
         if len(args) < 1:
             return ShellResponse("error", "Usage: /cat <file_path>", datetime.now(timezone.utc).isoformat())
-        
         file_path = args[0]
-        
         try:
             result = gke_service.exec_in_workspace(
-                workspace_id=session.session_id,
-                k8s_ns=session.k8s_ns,
-                pod=session.pod_name,
-                command=f"cat {shlex.quote(file_path)}",
-                timeout=60
+                workspace_id=session.session_id, k8s_ns=session.k8s_ns, pod=session.pod_name,
+                command=f"cat {shlex.quote(file_path)}", timeout=60
             )
-            
-            if result["success"]:
-                return ShellResponse("output", result["stdout"], datetime.now(timezone.utc).isoformat())
-            else:
-                return ShellResponse("error", f"Cat failed: {result['stderr']}", datetime.now(timezone.utc).isoformat())
+            if result.get("success"):
+                return ShellResponse("output", _clamp_text(result.get("stdout","")), datetime.now(timezone.utc).isoformat())
+            return ShellResponse("error", f"Cat failed: {result.get('stderr','')}", datetime.now(timezone.utc).isoformat())
         except Exception as e:
             return ShellResponse("error", f"Cat failed: {str(e)}", datetime.now(timezone.utc).isoformat())
     
@@ -776,22 +702,15 @@ class GKEShellService:
         """Handle /rm command"""
         if len(args) < 1:
             return ShellResponse("error", "Usage: /rm <path>", datetime.now(timezone.utc).isoformat())
-        
         path = args[0]
-        
         try:
             result = gke_service.exec_in_workspace(
-                workspace_id=session.session_id,
-                k8s_ns=session.k8s_ns,
-                pod=session.pod_name,
-                command=f"rm -rf {shlex.quote(path)}",
-                timeout=60
+                workspace_id=session.session_id, k8s_ns=session.k8s_ns, pod=session.pod_name,
+                command=f"rm -rf {shlex.quote(path)}", timeout=60
             )
-            
-            if result["success"]:
+            if result.get("success"):
                 return ShellResponse("success", f"🗑️ Removed {path}", datetime.now(timezone.utc).isoformat())
-            else:
-                return ShellResponse("error", f"Remove failed: {result['stderr']}", datetime.now(timezone.utc).isoformat())
+            return ShellResponse("error", f"Remove failed: {result.get('stderr','')}", datetime.now(timezone.utc).isoformat())
         except Exception as e:
             return ShellResponse("error", f"Remove failed: {str(e)}", datetime.now(timezone.utc).isoformat())
     
@@ -799,17 +718,12 @@ class GKEShellService:
         """Handle /ps command"""
         try:
             result = gke_service.exec_in_workspace(
-                workspace_id=session.session_id,
-                k8s_ns=session.k8s_ns,
-                pod=session.pod_name,
-                command="ps aux",
-                timeout=60
+                workspace_id=session.session_id, k8s_ns=session.k8s_ns, pod=session.pod_name,
+                command="ps aux", timeout=60
             )
-            
-            if result["success"]:
-                return ShellResponse("output", result["stdout"], datetime.now(timezone.utc).isoformat())
-            else:
-                return ShellResponse("error", f"PS failed: {result['stderr']}", datetime.now(timezone.utc).isoformat())
+            if result.get("success"):
+                return ShellResponse("output", _clamp_text(result.get("stdout","")), datetime.now(timezone.utc).isoformat())
+            return ShellResponse("error", f"PS failed: {result.get('stderr','')}", datetime.now(timezone.utc).isoformat())
         except Exception as e:
             return ShellResponse("error", f"PS failed: {str(e)}", datetime.now(timezone.utc).isoformat())
     
@@ -817,22 +731,15 @@ class GKEShellService:
         """Handle /kill command"""
         if len(args) < 1:
             return ShellResponse("error", "Usage: /kill <pid>", datetime.now(timezone.utc).isoformat())
-        
         pid = args[0]
-        
         try:
             result = gke_service.exec_in_workspace(
-                workspace_id=session.session_id,
-                k8s_ns=session.k8s_ns,
-                pod=session.pod_name,
-                command=f"kill {shlex.quote(pid)}",
-                timeout=30
+                workspace_id=session.session_id, k8s_ns=session.k8s_ns, pod=session.pod_name,
+                command=f"kill {shlex.quote(pid)}", timeout=30
             )
-            
-            if result["success"]:
+            if result.get("success"):
                 return ShellResponse("success", f"💀 Killed process {pid}", datetime.now(timezone.utc).isoformat())
-            else:
-                return ShellResponse("error", f"Kill failed: {result['stderr']}", datetime.now(timezone.utc).isoformat())
+            return ShellResponse("error", f"Kill failed: {result.get('stderr','')}", datetime.now(timezone.utc).isoformat())
         except Exception as e:
             return ShellResponse("error", f"Kill failed: {str(e)}", datetime.now(timezone.utc).isoformat())
     
@@ -840,23 +747,16 @@ class GKEShellService:
         """Handle /curl command"""
         if len(args) < 1:
             return ShellResponse("error", "Usage: /curl <url> [options]", datetime.now(timezone.utc).isoformat())
-        
         url = args[0]
         options = " ".join(args[1:]) if len(args) > 1 else ""
-        
         try:
             result = gke_service.exec_in_workspace(
-                workspace_id=session.session_id,
-                k8s_ns=session.k8s_ns,
-                pod=session.pod_name,
-                command=f"curl {options} {shlex.quote(url)}",
-                timeout=120
+                workspace_id=session.session_id, k8s_ns=session.k8s_ns, pod=session.pod_name,
+                command=f"curl {options} {shlex.quote(url)}", timeout=120
             )
-            
-            if result["success"]:
-                return ShellResponse("output", result["stdout"], datetime.now(timezone.utc).isoformat())
-            else:
-                return ShellResponse("error", f"Curl failed: {result['stderr']}", datetime.now(timezone.utc).isoformat())
+            if result.get("success"):
+                return ShellResponse("output", _clamp_text(result.get("stdout","")), datetime.now(timezone.utc).isoformat())
+            return ShellResponse("error", f"Curl failed: {result.get('stderr','')}", datetime.now(timezone.utc).isoformat())
         except Exception as e:
             return ShellResponse("error", f"Curl failed: {str(e)}", datetime.now(timezone.utc).isoformat())
     
@@ -864,22 +764,15 @@ class GKEShellService:
         """Handle /ping command"""
         if len(args) < 1:
             return ShellResponse("error", "Usage: /ping <host>", datetime.now(timezone.utc).isoformat())
-        
         host = args[0]
-        
         try:
             result = gke_service.exec_in_workspace(
-                workspace_id=session.session_id,
-                k8s_ns=session.k8s_ns,
-                pod=session.pod_name,
-                command=f"ping -c 3 {shlex.quote(host)}",
-                timeout=60
+                workspace_id=session.session_id, k8s_ns=session.k8s_ns, pod=session.pod_name,
+                command=f"ping -c 3 {shlex.quote(host)}", timeout=60
             )
-            
-            if result["success"]:
-                return ShellResponse("output", result["stdout"], datetime.now(timezone.utc).isoformat())
-            else:
-                return ShellResponse("error", f"Ping failed: {result['stderr']}", datetime.now(timezone.utc).isoformat())
+            if result.get("success"):
+                return ShellResponse("output", _clamp_text(result.get("stdout","")), datetime.now(timezone.utc).isoformat())
+            return ShellResponse("error", f"Ping failed: {result.get('stderr','')}", datetime.now(timezone.utc).isoformat())
         except Exception as e:
             return ShellResponse("error", f"Ping failed: {str(e)}", datetime.now(timezone.utc).isoformat())
     
@@ -887,17 +780,12 @@ class GKEShellService:
         """Handle /env command"""
         try:
             result = gke_service.exec_in_workspace(
-                workspace_id=session.session_id,
-                k8s_ns=session.k8s_ns,
-                pod=session.pod_name,
-                command="env | sort",
-                timeout=60
+                workspace_id=session.session_id, k8s_ns=session.k8s_ns, pod=session.pod_name,
+                command="env | sort", timeout=60
             )
-            
-            if result["success"]:
-                return ShellResponse("output", result["stdout"], datetime.now(timezone.utc).isoformat())
-            else:
-                return ShellResponse("error", f"ENV failed: {result['stderr']}", datetime.now(timezone.utc).isoformat())
+            if result.get("success"):
+                return ShellResponse("output", _clamp_text(result.get("stdout","")), datetime.now(timezone.utc).isoformat())
+            return ShellResponse("error", f"ENV failed: {result.get('stderr','')}", datetime.now(timezone.utc).isoformat())
         except Exception as e:
             return ShellResponse("error", f"ENV failed: {str(e)}", datetime.now(timezone.utc).isoformat())
     
@@ -905,19 +793,15 @@ class GKEShellService:
         """Handle /df command"""
         try:
             result = gke_service.exec_in_workspace(
-                workspace_id=session.session_id,
-                k8s_ns=session.k8s_ns,
-                pod=session.pod_name,
-                command="df -h",
-                timeout=60
+                workspace_id=session.session_id, k8s_ns=session.k8s_ns, pod=session.pod_name,
+                command="df -h", timeout=60
             )
-            
-            if result["success"]:
-                return ShellResponse("output", result["stdout"], datetime.now(timezone.utc).isoformat())
-            else:
-                return ShellResponse("error", f"DF failed: {result['stderr']}", datetime.now(timezone.utc).isoformat())
+            if result.get("success"):
+                return ShellResponse("output", _clamp_text(result.get("stdout","")), datetime.now(timezone.utc).isoformat())
+            return ShellResponse("error", f"DF failed: {result.get('stderr','')}", datetime.now(timezone.utc).isoformat())
         except Exception as e:
             return ShellResponse("error", f"DF failed: {str(e)}", datetime.now(timezone.utc).isoformat())
+
 
 # Global instance
 gke_shell_service = GKEShellService()

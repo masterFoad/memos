@@ -26,8 +26,8 @@ from .models.sessions import (
     SessionMetrics, SessionLogs
 )
 from .models.storage import (
-    MountRequest, Mount, MountList, FileInfo, FileList,
-    UploadRequest, DownloadRequest, StorageUsage, BucketInfo, FilestoreInfo
+    StorageConfig, AdditionalStorage, StorageType, StorageClass,
+    create_persistent_storage_config, create_gcs_storage_config, create_multi_storage_config
 )
 
 # Services (for advanced usage)
@@ -78,16 +78,13 @@ __all__ = [
     "SessionUpdateRequest",
     "SessionMetrics",
     "SessionLogs",
-    "MountRequest",
-    "Mount",
-    "MountList",
-    "FileInfo",
-    "FileList",
-    "UploadRequest",
-    "DownloadRequest",
-    "StorageUsage",
-    "BucketInfo",
-    "FilestoreInfo",
+    "StorageConfig",
+    "AdditionalStorage",
+    "StorageType",
+    "StorageClass",
+    "create_persistent_storage_config",
+    "create_gcs_storage_config",
+    "create_multi_storage_config",
     
     # Services
     "SessionService",

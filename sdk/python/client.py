@@ -659,6 +659,77 @@ class OnMemOSClient:
         return sessions
 
     # ============================================================================
+    # Persistent Storage Methods
+    # ============================================================================
+    
+    def upload_persist(self, namespace: str, user: str, src: str, dst: str = "") -> Dict[str, Any]:
+        """
+        Upload a file to persistent storage.
+        
+        Args:
+            namespace: Storage namespace
+            user: User identifier
+            src: Local file path to upload
+            dst: Destination filename (optional, uses src filename if not provided)
+        
+        Returns:
+            Upload result dictionary
+        """
+        import pathlib
+        
+        p = pathlib.Path(src)
+        if not p.exists():
+            raise FileNotFoundError(f"Source file not found: {src}")
+        
+        with p.open("rb") as f:
+            files = {"file": f}
+            params = {"namespace": namespace, "user": user}
+            if dst:
+                params["dst"] = dst
+            
+            response = self._make_request("POST", "/v1/fs/persist/upload", 
+                                        params=params, files=files)
+            return response.json()
+    
+    def download_persist(self, namespace: str, user: str, path: str, dst: str) -> str:
+        """
+        Download a file from persistent storage.
+        
+        Args:
+            namespace: Storage namespace
+            user: User identifier
+            path: Remote file path
+            dst: Local destination path
+        
+        Returns:
+            Local file path where file was saved
+        """
+        params = {"namespace": namespace, "user": user, "path": path}
+        response = self._make_request("GET", "/v1/fs/persist/download", 
+                                    params=params, stream=True)
+        
+        with open(dst, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+        
+        return dst
+    
+    def list_persist(self, namespace: str, user: str) -> Dict[str, Any]:
+        """
+        List files in persistent storage.
+        
+        Args:
+            namespace: Storage namespace
+            user: User identifier
+        
+        Returns:
+            Dictionary containing file list
+        """
+        params = {"namespace": namespace, "user": user}
+        response = self._make_request("GET", "/v1/fs/persist/list", params=params)
+        return response.json()
+    
+    # ============================================================================
     # Context Manager Support (Auto Cleanup)
     # ============================================================================
     

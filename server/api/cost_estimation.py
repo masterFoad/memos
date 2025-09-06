@@ -7,7 +7,7 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel
 
 from server.core.logging import get_api_logger
-from server.core.security import require_api_key
+from server.core.security import require_passport
 from server.services.cost_estimation import cost_estimation_service, CostEstimate
 from server.models.sessions import ResourceTier, StorageType
 from server.models.users import UserType
@@ -36,7 +36,7 @@ class CostComparisonRequest(BaseModel):
 @router.post("/estimate")
 async def estimate_session_cost(
     request: CostEstimationRequest,
-    user_info: dict = Depends(require_api_key)
+    user_info: dict = Depends(require_passport)
 ):
     """Estimate cost for a session configuration"""
     try:
@@ -100,7 +100,7 @@ async def estimate_session_cost(
 async def estimate_template_cost(
     template_id: str,
     duration_hours: float = Query(1.0, description="Expected duration in hours"),
-    user_info: dict = Depends(require_api_key)
+    user_info: dict = Depends(require_passport)
 ):
     """Estimate cost for a specific template"""
     try:
@@ -135,7 +135,7 @@ async def estimate_template_cost(
 @router.post("/compare")
 async def compare_costs(
     request: CostComparisonRequest,
-    user_info: dict = Depends(require_api_key)
+    user_info: dict = Depends(require_passport)
 ):
     """Compare costs between different configurations"""
     try:

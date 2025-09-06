@@ -31,16 +31,16 @@ class GkeSessionProvider:
             self.billing_service = BillingService()
     
     async def create(self, req: CreateSessionRequest) -> SessionInfo:
-        """Create GKE session with enhanced features and billing integration"""
+        """Create a new GKE session - now properly async"""
         logger.info(f"Creating GKE session for {req.user} in {req.namespace}")
-        
-        # Ensure database is connected
+        return await self._create_async(req)
+    
+    async def _create_async(self, req: CreateSessionRequest) -> SessionInfo:
+        """Async implementation of session creation"""
         await self._ensure_db_connected()
         
-        # Handle user management and storage allocation
+        # Resolve user
         user_type = req.user_type or UserType.FREE
-        
-        # Get or create user
         user = user_manager.get_user(req.user)
         if not user:
             user_manager.create_user(
@@ -50,18 +50,17 @@ class GkeSessionProvider:
             )
             logger.info(f"Created new user: {req.user} with type: {user_type}")
         else:
-            user_type = user.user_type  # Use existing user's type
+            user_type = user.user_type
             logger.info(f"Using existing user: {req.user} with type: {user_type}")
         
-        # BILLING INTEGRATION: Check user credits before creating session
+        # ---- Credit check (1 hour conservative) ----
         try:
-            # Get user's current credit balance
             current_credits = await self.db.get_user_credits(req.user)
+            if current_credits is None:
+                current_credits = 0.0
             logger.info(f"User {req.user} has ${current_credits:.2f} credits")
             
-            # Estimate session cost (we'll use a conservative estimate)
-            # For now, estimate 1 hour of usage
-            estimated_cost = 0.075  # PRO tier rate per hour
+            estimated_cost = 0.075  # PRO default
             if user_type == UserType.FREE:
                 estimated_cost = 0.05
             elif user_type == UserType.ENTERPRISE:
@@ -73,25 +72,19 @@ class GkeSessionProvider:
                 raise ValueError(f"Insufficient credits. Required: ${estimated_cost:.2f}, Available: ${current_credits:.2f}")
             
             logger.info(f"Credit check passed for user {req.user}")
-            
         except Exception as e:
             logger.error(f"Credit validation failed for user {req.user}: {e}")
             raise ValueError(f"Credit validation failed: {e}")
         
-        # Ensure workspace exists (for testing purposes)
+        # ---- Ensure workspace exists (testing-friendly) ----
         workspace = user_manager.get_workspace(req.user, req.workspace_id)
         if not workspace:
-            # Create a default workspace for testing
             from server.models.users import WorkspaceResourcePackage
-            # Use a package that the user can actually create
             user_entitlements = user_manager.get_user_entitlements(req.user)
             if user_entitlements and user_entitlements.allowed_packages:
-                # Use the first available package
                 resource_package = user_entitlements.allowed_packages[0]
             else:
-                # Fallback to FREE_MICRO
                 resource_package = WorkspaceResourcePackage.FREE_MICRO
-            
             user_manager.create_workspace(
                 user_id=req.user,
                 workspace_id=req.workspace_id,
@@ -100,12 +93,11 @@ class GkeSessionProvider:
             )
             logger.info(f"Created workspace {req.workspace_id} for user {req.user} with package {resource_package}")
         
-        # Generate session ID
+        # Stable session ID
         session_id = f"ws-{req.namespace}-{req.user}-{int(datetime.utcnow().timestamp())}"
         
-        # Convert to storage request and validate entitlements
+        # ---- Storage allocation (entitlement-aware) ----
         storage_request = req.to_storage_request(session_id)
-        
         if not user_manager.can_allocate_storage(req.workspace_id, storage_request):
             workspace = user_manager.get_workspace(req.user, req.workspace_id)
             if workspace:
@@ -117,20 +109,37 @@ class GkeSessionProvider:
             else:
                 raise ValueError(f"Workspace {req.workspace_id} not found for user {req.user}")
         
-        # Allocate storage
         storage_allocation = user_manager.allocate_storage(req.workspace_id, storage_request)
         logger.info(f"Allocated storage for user {req.user}: {storage_allocation}")
         
-        # Build storage configuration from allocation
+        # Build storage config from allocation if not provided
         storage_config = req.storage_config
         if storage_config is None:
-            if storage_allocation.bucket_name:
+            has_bucket = bool(storage_allocation.bucket_name)
+            has_pvc = bool(storage_allocation.persistent_volume_name)
+
+            if has_bucket and has_pvc:
+                # Primary: bucket at /workspace, Additional: PVC at /data
                 storage_config = StorageConfig(
                     storage_type=StorageType.GCS_FUSE,
                     bucket_name=storage_allocation.bucket_name,
                     mount_path=storage_request.mount_path
                 )
-            elif storage_allocation.persistent_volume_name:
+                storage_config.additional_storage = [
+                    StorageConfig(
+                        storage_type=StorageType.PERSISTENT_VOLUME,
+                        pvc_name=storage_allocation.persistent_volume_name,
+                        pvc_size=f"{storage_request.persistent_storage_size_gb}Gi",
+                        mount_path="/data"
+                    )
+                ]
+            elif has_bucket:
+                storage_config = StorageConfig(
+                    storage_type=StorageType.GCS_FUSE,
+                    bucket_name=storage_allocation.bucket_name,
+                    mount_path=storage_request.mount_path
+                )
+            elif has_pvc:
                 storage_config = StorageConfig(
                     storage_type=StorageType.PERSISTENT_VOLUME,
                     pvc_name=storage_allocation.persistent_volume_name,
@@ -139,21 +148,78 @@ class GkeSessionProvider:
                 )
             else:
                 storage_config = StorageConfig(storage_type=StorageType.EPHEMERAL)
-        
-        # Create workspace
-        ws = gke_service.create_workspace(
-            template=req.template,
-            namespace=req.namespace,
-            user=req.user,
-            storage_config=storage_config,
-            resource_tier=req.resource_tier,
-            env=req.env
-        )
-        
-        # BILLING INTEGRATION: Start session billing after successful creation
+
+        # Augment storage_config with workspace defaults (auto-mount) if available
         try:
-            # Determine hourly rate based on user type and resource tier
-            hourly_rate = 0.075  # Default PRO rate
+            defaults = await self.db.get_workspace_defaults(req.workspace_id)
+            bucket_default = defaults.get("bucket") if defaults else None
+            filestore_default = defaults.get("filestore") if defaults else None
+
+            additional: list = []
+            # Prefer bucket as primary if both exist
+            if bucket_default and (storage_config.storage_type == StorageType.EPHEMERAL):
+                bucket_name = bucket_default.get("resource_name") or (bucket_default.get("metadata") or {}).get("bucket_name")
+                if bucket_name:
+                    storage_config = StorageConfig(
+                        storage_type=StorageType.GCS_FUSE,
+                        bucket_name=bucket_name,
+                        mount_path=storage_config.mount_path
+                    )
+
+            # If primary is bucket and filestore default exists, add as additional
+            if filestore_default:
+                pvc_name = (filestore_default.get("metadata") or {}).get("pvc_name")
+                if not pvc_name:
+                    # Fallback to resource_name if pvc_name stored there
+                    pvc_name = filestore_default.get("resource_name")
+                if pvc_name:
+                    additional.append(StorageConfig(
+                        storage_type=StorageType.PERSISTENT_VOLUME,
+                        pvc_name=pvc_name,
+                        mount_path="/data"
+                    ))
+
+            # If primary is PVC and bucket default exists, add bucket as additional
+            if bucket_default and storage_config.storage_type == StorageType.PERSISTENT_VOLUME:
+                bucket_name = bucket_default.get("resource_name") or (bucket_default.get("metadata") or {}).get("bucket_name")
+                if bucket_name:
+                    additional.append(StorageConfig(
+                        storage_type=StorageType.GCS_FUSE,
+                        bucket_name=bucket_name,
+                        mount_path="/bucket"
+                    ))
+
+            if additional:
+                storage_config.additional_storage = (storage_config.additional_storage or []) + additional
+        except Exception as e:
+            logger.warning(f"Default storage resolution failed for workspace {req.workspace_id}: {e}")
+        
+        # ---- Create pod/workspace on GKE ----
+        try:
+            ws = gke_service.create_workspace(
+                template=req.template,
+                namespace=req.namespace,
+                user=req.user,
+                storage_config=storage_config,
+                resource_tier=req.resource_tier,
+                env=req.env
+            )
+        except Exception as e:
+            # Roll back allocation on failure
+            logger.error(f"GKE workspace creation failed: {e}")
+            try:
+                from server.models.users import WorkspaceStorageAllocation
+                # storage_allocation is already a pydantic model; ensure we have the object
+                if hasattr(storage_allocation, "workspace_id"):
+                    user_manager.deallocate_storage(storage_allocation.workspace_id, storage_allocation)
+            except Exception as de:
+                logger.warning(f"Failed to rollback storage allocation after GKE error: {de}")
+            raise
+        
+        # ---- Billing start (use actual resource tier) ----
+        try:
+            # Keep hourly_rate for metadata as before
+            hourly_rate = 0.075
             if user_type == UserType.FREE:
                 hourly_rate = 0.05
             elif user_type == UserType.ENTERPRISE:
@@ -161,21 +227,18 @@ class GkeSessionProvider:
             elif user_type == UserType.ADMIN:
                 hourly_rate = 0.0
             
-            # Start session billing
-            billing_info = await self.billing_service.start_session_billing(
-                session_id, req.user, "medium"  # Use resource tier for more accurate billing
+            billing_tier = (req.resource_tier.value if req.resource_tier else "small")
+            await self.billing_service.start_session_billing(
+                session_id, req.user, billing_tier
             )
-            logger.info(f"Started session billing for {session_id}: ${hourly_rate:.4f}/hour")
-            
+            logger.info(f"Started session billing for {session_id}: tier={billing_tier}, ${hourly_rate:.4f}/hour")
         except Exception as e:
             logger.error(f"Failed to start session billing for {session_id}: {e}")
-            # Don't fail the session creation, but log the billing error
-            # In production, you might want to fail here
+            # Non-fatal
         
-        # Store session metadata
-        sid = ws["workspace_id"]
-        self._map[sid] = {
-            "k8s_ns": ws["namespace"], 
+        # ---- Track session ----
+        self._map[session_id] = {
+            "k8s_ns": ws["namespace"],
             "pod": ws["pod"],
             "namespace": req.namespace,
             "user": req.user,
@@ -184,13 +247,14 @@ class GkeSessionProvider:
             "resource_tier": req.resource_tier.value if req.resource_tier else None,
             "storage_allocation": storage_allocation.dict() if storage_allocation else None,
             "user_type": user_type.value,
-            "session_id": session_id,  # Store for billing cleanup
-            "hourly_rate": hourly_rate
+            "session_id": session_id,
+            "hourly_rate": hourly_rate,
+            "billing_tier": billing_tier,
         }
         
-        # Create session info
+        # ---- Build SessionInfo ----
         session_info = SessionInfo(
-            id=sid,
+            id=session_id,
             provider=req.provider,
             namespace=req.namespace,
             user=req.user,
@@ -221,11 +285,10 @@ class GkeSessionProvider:
             }
         )
         
-        # Add WebSocket URL
         if ws["namespace"] and ws["pod"]:
-            session_info.websocket = f"/v1/gke/shell/{sid}?k8s_ns={ws['namespace']}&pod={ws['pod']}"
+            session_info.websocket = f"/v1/gke/shell/{session_id}?k8s_ns={ws['namespace']}&pod={ws['pod']}"
         
-        logger.info(f"Created GKE session: {sid}")
+        logger.info(f"Created GKE session: {session_id}")
         return session_info
     
     def get(self, session_id: str) -> Optional[SessionInfo]:
@@ -234,13 +297,12 @@ class GkeSessionProvider:
         if not meta:
             return None
         
-        # Create session info from metadata
         session_info = SessionInfo(
             id=session_id,
             provider="gke",
             namespace=meta["namespace"],
             user=meta["user"],
-            workspace_id=meta.get("workspace_id", "unknown"),  # Fallback for existing sessions
+            workspace_id=meta.get("workspace_id", "unknown"),
             status="running",
             k8s_namespace=meta["k8s_ns"],
             pod_name=meta["pod"],
@@ -249,12 +311,11 @@ class GkeSessionProvider:
             details={
                 "k8s_ns": meta["k8s_ns"],
                 "pod": meta["pod"],
-                "storage_type": meta.get("storage_config", {}).get("storage_type", "ephemeral"),
+                "storage_type": (meta.get("storage_config", {}) or {}).get("storage_type", "ephemeral"),
                 "resource_tier": meta.get("resource_tier", "small")
             }
         )
         
-        # Add WebSocket URL
         if meta["k8s_ns"] and meta["pod"]:
             session_info.websocket = f"/v1/gke/shell/{session_id}?k8s_ns={meta['k8s_ns']}&pod={meta['pod']}"
         
@@ -262,28 +323,28 @@ class GkeSessionProvider:
     
     async def delete(self, session_id: str) -> bool:
         """Delete session and cleanup resources with billing integration"""
-        # Ensure database is connected
+        return await self._delete_async(session_id)
+    
+    async def _delete_async(self, session_id: str) -> bool:
+        """Async implementation of session deletion"""
         await self._ensure_db_connected()
         
         meta = self._map.get(session_id)
         if not meta:
             return False
         
-        # BILLING INTEGRATION: Stop session billing and calculate final cost
+        # ---- Billing stop & charge ----
         try:
             if meta.get("session_id"):
-                # Stop session billing
                 final_billing = await self.billing_service.stop_session_billing(meta["session_id"])
                 if final_billing:
                     total_cost = final_billing.get('total_cost', 0)
                     total_hours = final_billing.get('total_hours', 0)
                     logger.info(f"Session {session_id} billing completed: {total_hours:.2f} hours = ${total_cost:.4f}")
-                    
-                    # Deduct credits from user account
                     if total_cost > 0:
                         await self.db.deduct_credits(
-                            meta['user'], 
-                            total_cost, 
+                            meta['user'],
+                            total_cost,
                             f"Session {session_id} runtime",
                             session_id=meta["session_id"]
                         )
@@ -292,29 +353,25 @@ class GkeSessionProvider:
                     logger.warning(f"No billing info found for session {session_id}")
         except Exception as e:
             logger.error(f"Failed to process billing for session {session_id}: {e}")
-            # Don't fail the deletion, but log the billing error
         
-        # Get storage config for cleanup
+        # ---- Storage deallocation ----
         storage_config = None
         if meta.get("storage_config"):
             storage_config = StorageConfig(**meta["storage_config"])
         
-        # Deallocate storage from user management
         if meta.get("storage_allocation"):
             try:
-                storage_allocation_dict = meta["storage_allocation"]
-                # Convert dictionary to WorkspaceStorageAllocation object
                 from server.models.users import WorkspaceStorageAllocation
-                storage_allocation = WorkspaceStorageAllocation(**storage_allocation_dict)
+                storage_allocation = WorkspaceStorageAllocation(**meta["storage_allocation"])
                 user_manager.deallocate_storage(storage_allocation.workspace_id, storage_allocation)
                 logger.info(f"Deallocated storage for user {meta['user']}: {storage_allocation}")
             except Exception as e:
                 logger.warning(f"Failed to deallocate storage for session {session_id}: {e}")
         
-        # Delete workspace
+        # ---- Delete pod/workspace ----
         success = gke_service.delete_workspace(
-            meta["k8s_ns"], 
-            meta["pod"], 
+            meta["k8s_ns"],
+            meta["pod"],
             storage_config
         )
         
@@ -339,29 +396,15 @@ class GkeSessionProvider:
             return {"success": False, "error": "Session not found"}
         
         if async_execution:
-            # Submit as job for asynchronous execution
-            return gke_service.submit_job(
-                session_id, 
-                meta["k8s_ns"], 
-                meta["pod"], 
-                command
-            )
+            return gke_service.submit_job(session_id, meta["k8s_ns"], meta["pod"], command)
         else:
-            # Execute synchronously
-            return gke_service.exec_in_workspace(
-                session_id, 
-                meta["k8s_ns"], 
-                meta["pod"], 
-                command, 
-                timeout
-            )
+            return gke_service.exec_in_workspace(session_id, meta["k8s_ns"], meta["pod"], command, timeout)
 
     def get_job_status(self, job_id: str, job_name: str, session_id: str) -> Dict[str, Any]:
         """Get status of a submitted job"""
         meta = self._map.get(session_id)
         if not meta:
             return {"success": False, "error": "Session not found"}
-        
         return gke_service.get_job_status(job_id, meta["k8s_ns"], job_name)
 
 

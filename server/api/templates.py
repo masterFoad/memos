@@ -3,13 +3,15 @@ Session Templates API - Template management endpoints
 """
 
 from fastapi import APIRouter, HTTPException, Depends, Query
-from typing import List, Optional
-from pydantic import BaseModel
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field
 
 from server.core.logging import get_api_logger
-from server.core.security import require_api_key
+from server.core.security import require_passport
 from server.models.session_templates import (
-    SessionTemplate, TemplateCategory, template_manager, TemplateManager
+    SessionTemplate,
+    TemplateCategory,
+    template_manager,
 )
 from server.models.users import UserType
 
@@ -27,9 +29,9 @@ class CreateTemplateRequest(BaseModel):
     image_type: str = "alpine_basic"
     storage_type: str = "ephemeral"
     storage_size_gb: int = 0
-    env_vars: dict = {}
-    pre_install_commands: List[str] = []
-    tags: List[str] = []
+    env_vars: Dict[str, Any] = Field(default_factory=dict)
+    pre_install_commands: List[str] = Field(default_factory=list)
+    tags: List[str] = Field(default_factory=list)
     estimated_cost_per_hour: float = 0.05
 
 
@@ -42,7 +44,7 @@ class UpdateTemplateRequest(BaseModel):
     image_type: Optional[str] = None
     storage_type: Optional[str] = None
     storage_size_gb: Optional[int] = None
-    env_vars: Optional[dict] = None
+    env_vars: Optional[Dict[str, Any]] = None
     pre_install_commands: Optional[List[str]] = None
     tags: Optional[List[str]] = None
     estimated_cost_per_hour: Optional[float] = None
@@ -54,39 +56,37 @@ async def list_templates(
     user_type: Optional[str] = Query(None, description="Filter by user type"),
     tags: Optional[str] = Query(None, description="Filter by tags (comma-separated)"),
     popular: bool = Query(False, description="Get popular templates only"),
-    limit: int = Query(10, description="Maximum number of templates to return")
+    limit: int = Query(10, description="Maximum number of templates to return"),
 ):
     """List available session templates with optional filtering"""
     try:
-        # Parse user type if provided
         parsed_user_type = None
         if user_type:
             try:
                 parsed_user_type = UserType(user_type)
             except ValueError:
                 raise HTTPException(status_code=400, detail=f"Invalid user type: {user_type}")
-        
-        # Parse tags if provided
+
         parsed_tags = None
         if tags:
-            parsed_tags = [tag.strip() for tag in tags.split(",")]
-        
-        # Get templates based on filters
+            parsed_tags = [tag.strip() for tag in tags.split(",") if tag.strip()]
+
         if popular:
             templates = template_manager.get_popular_templates(limit)
         else:
             templates = template_manager.list_templates(
                 category=category,
                 user_type=parsed_user_type,
-                tags=parsed_tags
-            )
-            templates = templates[:limit]
-        
+                tags=parsed_tags,
+            )[:limit]
+
         return {
             "templates": [template.dict() for template in templates],
-            "total": len(templates)
+            "total": len(templates),
         }
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error listing templates: {e}")
         raise HTTPException(status_code=500, detail="Failed to list templates")
@@ -99,9 +99,7 @@ async def get_template(template_id: str):
         template = template_manager.get_template(template_id)
         if not template:
             raise HTTPException(status_code=404, detail=f"Template {template_id} not found")
-        
         return template.dict()
-        
     except HTTPException:
         raise
     except Exception as e:
@@ -112,15 +110,13 @@ async def get_template(template_id: str):
 @router.post("/")
 async def create_template(
     request: CreateTemplateRequest,
-    user_info: dict = Depends(require_api_key)
+    user_info: dict = Depends(require_passport),
 ):
     """Create a new session template"""
     try:
-        # Check if template already exists
         if template_manager.get_template(request.template_id):
             raise HTTPException(status_code=409, detail=f"Template {request.template_id} already exists")
-        
-        # Create template object
+
         template = SessionTemplate(
             template_id=request.template_id,
             name=request.name,
@@ -134,17 +130,14 @@ async def create_template(
             pre_install_commands=request.pre_install_commands,
             tags=request.tags,
             estimated_cost_per_hour=request.estimated_cost_per_hour,
-            created_by=user_info.get("user_id")
+            created_by=user_info.get("user_id"),
         )
-        
-        # Add template
-        success = template_manager.create_template(template)
-        if not success:
+
+        if not template_manager.create_template(template):
             raise HTTPException(status_code=500, detail="Failed to create template")
-        
+
         logger.info(f"Created template {request.template_id} by user {user_info.get('user_id')}")
         return template.dict()
-        
     except HTTPException:
         raise
     except Exception as e:
@@ -156,32 +149,26 @@ async def create_template(
 async def update_template(
     template_id: str,
     request: UpdateTemplateRequest,
-    user_info: dict = Depends(require_api_key)
+    user_info: dict = Depends(require_passport),
 ):
     """Update an existing template"""
     try:
-        # Get existing template
         template = template_manager.get_template(template_id)
         if not template:
             raise HTTPException(status_code=404, detail=f"Template {template_id} not found")
-        
-        # Check if user can modify this template
+
         if template.created_by and template.created_by != user_info.get("user_id"):
             raise HTTPException(status_code=403, detail="Not authorized to modify this template")
-        
-        # Update fields
+
         update_data = request.dict(exclude_unset=True)
         for field, value in update_data.items():
             setattr(template, field, value)
-        
-        # Save updated template
-        success = template_manager.update_template(template)
-        if not success:
+
+        if not template_manager.update_template(template):
             raise HTTPException(status_code=500, detail="Failed to update template")
-        
+
         logger.info(f"Updated template {template_id} by user {user_info.get('user_id')}")
         return template.dict()
-        
     except HTTPException:
         raise
     except Exception as e:
@@ -192,27 +179,22 @@ async def update_template(
 @router.delete("/{template_id}")
 async def delete_template(
     template_id: str,
-    user_info: dict = Depends(require_api_key)
+    user_info: dict = Depends(require_passport),
 ):
     """Delete a template"""
     try:
-        # Get existing template
         template = template_manager.get_template(template_id)
         if not template:
             raise HTTPException(status_code=404, detail=f"Template {template_id} not found")
-        
-        # Check if user can delete this template
+
         if template.created_by and template.created_by != user_info.get("user_id"):
             raise HTTPException(status_code=403, detail="Not authorized to delete this template")
-        
-        # Delete template
-        success = template_manager.delete_template(template_id)
-        if not success:
+
+        if not template_manager.delete_template(template_id):
             raise HTTPException(status_code=500, detail="Failed to delete template")
-        
+
         logger.info(f"Deleted template {template_id} by user {user_info.get('user_id')}")
         return {"message": f"Template {template_id} deleted successfully"}
-        
     except HTTPException:
         raise
     except Exception as e:
@@ -238,9 +220,8 @@ async def get_popular_templates(limit: int = 5):
         templates = template_manager.get_popular_templates(limit)
         return {
             "templates": [template.dict() for template in templates],
-            "total": len(templates)
+            "total": len(templates),
         }
-        
     except Exception as e:
         logger.error(f"Error getting popular templates: {e}")
         raise HTTPException(status_code=500, detail="Failed to get popular templates")

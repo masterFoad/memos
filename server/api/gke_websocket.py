@@ -2,12 +2,13 @@
 GKE WebSocket API - Interactive shell endpoints
 """
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from websockets.exceptions import ConnectionClosed
 from fastapi.responses import HTMLResponse
+import json
 
 from server.core.logging import get_api_logger, get_websocket_logger
-from server.core.security import require_api_key
+from server.core.security import verify_passport  # validate user passports for WS
 from server.services.gke.gke_websocket_shell import gke_shell_service
 
 logger = get_api_logger()
@@ -15,14 +16,16 @@ websocket_logger = get_websocket_logger()
 
 router = APIRouter(prefix="/v1/gke", tags=["gke-websocket"])
 
+
 @router.get("/shell/{session_id}")
 async def gke_shell_page(session_id: str, k8s_ns: str, pod: str):
-    """HTML page for GKE WebSocket shell"""
+    """HTML page for GKE WebSocket shell (passport is read from the page URL querystring and forwarded to WS)."""
     html_content = f"""
     <!DOCTYPE html>
     <html>
     <head>
         <title>OnMemOS GKE Shell - {session_id}</title>
+        <meta charset="utf-8" />
         <style>
             body {{
                 font-family: 'Courier New', monospace;
@@ -54,18 +57,10 @@ async def gke_shell_page(session_id: str, k8s_ns: str, pod: str):
                 margin-top: 10px;
                 outline: none;
             }}
-            .info {{
-                color: #4CAF50;
-            }}
-            .error {{
-                color: #f44336;
-            }}
-            .warning {{
-                color: #ff9800;
-            }}
-            .success {{
-                color: #4CAF50;
-            }}
+            .info {{ color: #4CAF50; }}
+            .error {{ color: #f44336; }}
+            .warning {{ color: #ff9800; }}
+            .success {{ color: #4CAF50; }}
         </style>
     </head>
     <body>
@@ -77,23 +72,36 @@ async def gke_shell_page(session_id: str, k8s_ns: str, pod: str):
         <script>
             const terminal = document.getElementById('terminal');
             const input = document.getElementById('input');
-            const sessionId = '{session_id}';
-            const k8sNs = '{k8s_ns}';
-            const pod = '{pod}';
+            const sessionId = {json.dumps(session_id)};
+            const k8sNs = {json.dumps(k8s_ns)};
+            const pod = {json.dumps(pod)};
+
+            // pull passport from the page URL (e.g. .../shell/<id>?k8s_ns=...&pod=...&passport=YOUR_PASSPORT)
+            const params = new URLSearchParams(window.location.search);
+            const passport = params.get('passport') || '';
+
+            function wsScheme() {{
+                return window.location.protocol === 'https:' ? 'wss' : 'ws';
+            }}
+
+            // WebSocket connection (forward passport to WS querystring)
+            const wsUrl = `${{wsScheme()}}://${{window.location.host}}/v1/gke/shell/${{sessionId}}?k8s_ns=${{encodeURIComponent(k8sNs)}}&pod=${{encodeURIComponent(pod)}}` + (passport ? `&passport=${{encodeURIComponent(passport)}}` : '');
+            const ws = new WebSocket(wsUrl);
             
-            // WebSocket connection
-            const ws = new WebSocket(`ws://${{window.location.host}}/v1/gke/shell/${{sessionId}}?k8s_ns=${{k8sNs}}&pod=${{pod}}`);
-            
-            ws.onopen = function(event) {{
+            ws.onopen = function() {{
                 appendToTerminal('🔗 Connected to GKE shell...', 'info');
             }};
             
             ws.onmessage = function(event) {{
-                const data = JSON.parse(event.data);
-                handleMessage(data);
+                try {{
+                    const data = JSON.parse(event.data);
+                    handleMessage(data);
+                }} catch (e) {{
+                    appendToTerminal(String(event.data));
+                }}
             }};
             
-            ws.onclose = function(event) {{
+            ws.onclose = function() {{
                 appendToTerminal('🔌 Connection closed', 'error');
             }};
             
@@ -103,41 +111,24 @@ async def gke_shell_page(session_id: str, k8s_ns: str, pod: str):
             
             function handleMessage(data) {{
                 const type = data.type;
-                const content = data.content;
+                const content = data.content || data.message || '';
                 
                 switch(type) {{
-                    case 'output':
-                        appendToTerminal(content);
-                        break;
-                    case 'error':
-                        appendToTerminal(content, 'error');
-                        break;
-                    case 'info':
-                        appendToTerminal(content, 'info');
-                        break;
-                    case 'warning':
-                        appendToTerminal(content, 'warning');
-                        break;
-                    case 'success':
-                        appendToTerminal(content, 'success');
-                        break;
-                    case 'clear':
-                        terminal.innerHTML = '';
-                        break;
-                    case 'prompt':
-                        // Don't display prompt, it will be shown in input
-                        break;
-                    default:
-                        appendToTerminal(content);
+                    case 'output':   appendToTerminal(content); break;
+                    case 'error':    appendToTerminal(content, 'error'); break;
+                    case 'info':     appendToTerminal(content, 'info'); break;
+                    case 'warning':  appendToTerminal(content, 'warning'); break;
+                    case 'success':  appendToTerminal(content, 'success'); break;
+                    case 'clear':    terminal.innerHTML = ''; break;
+                    case 'prompt':   /* prompts are handled client-side */ break;
+                    default:         appendToTerminal(content || JSON.stringify(data));
                 }}
             }}
             
             function appendToTerminal(text, className = '') {{
                 const div = document.createElement('div');
                 div.textContent = text;
-                if (className) {{
-                    div.className = className;
-                }}
+                if (className) div.className = className;
                 terminal.appendChild(div);
                 terminal.scrollTop = terminal.scrollHeight;
             }}
@@ -146,69 +137,98 @@ async def gke_shell_page(session_id: str, k8s_ns: str, pod: str):
                 if (e.key === 'Enter') {{
                     const command = input.value.trim();
                     if (command) {{
-                        // Send command
-                        ws.send(JSON.stringify({{
-                            type: 'command',
-                            command: command
-                        }}));
-                        
-                        // Clear input
+                        ws.send(JSON.stringify({{ type: 'command', command }}));
                         input.value = '';
                     }}
                 }}
             }});
             
             // Handle window resize
-            window.addEventListener('resize', function() {{
-                ws.send(JSON.stringify({{
-                    type: 'resize',
-                    cols: Math.floor(terminal.clientWidth / 8),
-                    rows: Math.floor(terminal.clientHeight / 20)
-                }}));
-            }});
+            function sendResize() {{
+                if (ws.readyState === WebSocket.OPEN) {{
+                    ws.send(JSON.stringify({{
+                        type: 'resize',
+                        cols: Math.floor(terminal.clientWidth / 8),
+                        rows: Math.floor(terminal.clientHeight / 20)
+                    }}));
+                }}
+            }}
+            window.addEventListener('resize', sendResize);
+            // initial size
+            sendResize();
         </script>
     </body>
     </html>
     """
     return HTMLResponse(content=html_content)
 
+
+def _get_passport_from_ws_query(websocket: WebSocket) -> str:
+    """Extract passport from WebSocket query string (required)."""
+    passport = websocket.query_params.get("passport")
+    if not passport:
+        raise ValueError("passport required")
+    return passport
+
+
 @router.websocket("/shell/{session_id}")
 async def gke_websocket_shell(websocket: WebSocket, session_id: str):
-    """WebSocket endpoint for GKE interactive shell with billing integration"""
-    await websocket.accept()
-    
+    """WebSocket endpoint for GKE interactive shell with billing integration."""
     try:
-        # Extract query parameters
+        # Validate query params BEFORE accepting
         k8s_ns = websocket.query_params.get("k8s_ns")
         pod = websocket.query_params.get("pod")
-        
         if not k8s_ns or not pod:
             await websocket.close(code=1008, reason="Missing k8s_ns or pod parameters")
             return
-        
-        # Get user_id from session (for billing integration)
-        user_id = None
+
+        # Validate passport BEFORE accept (and ensure session ownership)
+        try:
+            passport = _get_passport_from_ws_query(websocket)
+            user_info = await verify_passport(x_api_key=passport)
+        except Exception as e:
+            await websocket.close(code=1008, reason=f"passport error: {e}")
+            return
+
+        # Check session ownership
         try:
             from server.services.sessions.manager import sessions_manager
-            session_info = sessions_manager.get_session(session_id)
-            if session_info:
-                user_id = session_info.get("user")
-                logger.info(f"Found user {user_id} for session {session_id}")
+            session_info = await sessions_manager.get_session(session_id)
+            if not session_info:
+                await websocket.close(code=1008, reason="Session not found")
+                return
+            owner_user_id = session_info.get("user")
+            if not owner_user_id or owner_user_id != user_info.get("user_id"):
+                await websocket.close(code=1008, reason="Session not owned by passport user")
+                return
         except Exception as e:
-            logger.warning(f"Could not get user_id for session {session_id}: {e}")
-        
+            await websocket.close(code=1011, reason=f"Session check failed: {e}")
+            return
+
+        # OK to accept now
+        await websocket.accept()
+
         # Handle WebSocket connection with billing
-        await gke_shell_service.handle_websocket(websocket, session_id, k8s_ns, pod, user_id)
-        
+        await gke_shell_service.handle_websocket(websocket, session_id, k8s_ns, pod, user_info.get("user_id"))
+
     except WebSocketDisconnect:
         websocket_logger.info(f"WebSocket disconnected: {session_id}")
     except ConnectionClosed as e:
         # Normal WebSocket closure - not an error
-        if e.code == 1000:
+        if getattr(e, "code", None) == 1000:
             websocket_logger.debug(f"WebSocket connection closed normally: {e}")
         else:
-            websocket_logger.info(f"WebSocket connection closed with code {e.code}: {e}")
+            websocket_logger.info(f"WebSocket connection closed with code {getattr(e, 'code', 'unknown')}: {e}")
     except Exception as e:
         websocket_logger.error(f"WebSocket error: {e}")
-        if websocket.client_state.value < 3:  # Not closed
-            await websocket.close(code=1011, reason=f"Internal error: {str(e)}")
+        # Try to notify client if still open-ish
+        try:
+            await websocket.send_text(
+                '{"type":"error","message":' + json.dumps(f"Internal error: {str(e)}") + "}"
+            )
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1011, reason="Internal error")
+        except Exception:
+            pass

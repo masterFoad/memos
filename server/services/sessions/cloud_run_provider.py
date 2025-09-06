@@ -8,7 +8,18 @@ from server.services.cloudrun.cloudrun_service import cloudrun_service
 
 class CloudRunSessionProvider(SessionProviderBase):
     def create(self, req: CreateSessionRequest) -> SessionInfo:
-        ws = cloudrun_service.create_workspace(req.template, req.namespace, req.user, req.ttl_minutes, req.storage)
+        # Cloud Run service expects storage_options (dict) not req.storage
+        storage_opts = req.storage_config.dict() if getattr(req, "storage_config", None) else None
+        template = req.template or "python"
+
+        ws = cloudrun_service.create_workspace(
+            template=template,
+            namespace=req.namespace,
+            user=req.user,
+            ttl_minutes=req.ttl_minutes,
+            storage_options=storage_opts,
+        )
+
         return SessionInfo(
             id=ws["id"],
             provider=SessionProvider.cloud_run,
@@ -17,7 +28,7 @@ class CloudRunSessionProvider(SessionProviderBase):
             workspace_id=req.workspace_id,
             status=ws["status"],
             url=ws["service_url"],
-            websocket=f"/v1/cloudrun/workspaces/{ws['id']}/shell",  # if you have that websocket
+            websocket=f"/v1/cloudrun/workspaces/{ws['id']}/shell",  # keep path stable
             ssh=False,
             details=ws,
         )
@@ -31,7 +42,7 @@ class CloudRunSessionProvider(SessionProviderBase):
             provider=SessionProvider.cloud_run,
             namespace=ws["namespace"],
             user=ws["user"],
-            workspace_id=ws.get("workspace_id", "unknown"),  # Fallback for existing sessions
+            workspace_id=ws.get("workspace_id", "unknown"),
             status=ws["status"],
             url=ws["service_url"],
             websocket=f"/v1/cloudrun/workspaces/{ws['id']}/shell",
@@ -39,7 +50,8 @@ class CloudRunSessionProvider(SessionProviderBase):
             details=ws,
         )
 
-    def delete(self, session_id: str) -> bool:
+    async def delete(self, session_id: str) -> bool:
+        # SessionsManager awaits this; keep it async and call sync deleter inside.
         return cloudrun_service.delete_workspace(session_id)
 
     def execute(self, session_id: str, command: str, timeout: int = 120) -> Dict[str, Any]:

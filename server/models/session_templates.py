@@ -4,9 +4,10 @@ Session Templates - Predefined session configurations for better UX
 
 from enum import Enum
 from typing import Dict, Any, Optional, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 from .sessions import ResourceTier, StorageType, ImageType, GPUType
 from .users import UserType
+from datetime import datetime
 
 
 class TemplateCategory(str, Enum):
@@ -29,7 +30,7 @@ class SessionTemplate(BaseModel):
     category: TemplateCategory = Field(..., description="Template category")
     
     # Access control
-    user_types: List[UserType] = Field(default=[UserType.FREE], description="Allowed user types")
+    user_types: List[UserType] = Field(default_factory=lambda: [UserType.FREE], description="Allowed user types")
     is_public: bool = Field(default=True, description="Whether template is publicly available")
     created_by: Optional[str] = Field(default=None, description="User who created the template")
     
@@ -40,12 +41,12 @@ class SessionTemplate(BaseModel):
     
     # Storage configuration
     storage_type: StorageType = Field(default=StorageType.EPHEMERAL, description="Storage type")
-    storage_size_gb: int = Field(default=0, description="Storage size in GB")
+    storage_size_gb: int = Field(default=0, ge=0, description="Storage size in GB")
     mount_path: str = Field(default="/workspace", description="Storage mount path")
     
     # Session configuration
-    default_ttl_minutes: int = Field(default=60, description="Default session TTL")
-    max_ttl_minutes: int = Field(default=1440, description="Maximum session TTL")
+    default_ttl_minutes: int = Field(default=60, ge=1, description="Default session TTL")
+    max_ttl_minutes: int = Field(default=1440, ge=1, description="Maximum session TTL")
     
     # Environment and tools
     env_vars: Dict[str, str] = Field(default_factory=dict, description="Default environment variables")
@@ -57,7 +58,7 @@ class SessionTemplate(BaseModel):
     
     # Usage statistics
     usage_count: int = Field(default=0, description="Number of times template was used")
-    last_used: Optional[str] = Field(default=None, description="Last usage timestamp")
+    last_used: Optional[datetime] = Field(default=None, description="Last usage timestamp")
     
     class Config:
         json_encoders = {
@@ -68,6 +69,13 @@ class SessionTemplate(BaseModel):
             StorageType: lambda v: v.value,
             TemplateCategory: lambda v: v.value,
         }
+
+    @validator("default_ttl_minutes", always=True)
+    def _validate_ttls(cls, v, values):
+        max_ttl = values.get("max_ttl_minutes", 1440)
+        if v > max_ttl:
+            raise ValueError("default_ttl_minutes cannot exceed max_ttl_minutes")
+        return v
 
 
 class TemplateManager:
@@ -253,7 +261,11 @@ class TemplateManager:
         
         # Filter by tags
         if tags:
-            templates = [t for t in templates if any(tag in t.tags for tag in tags)]
+            want = {tag.strip().lower() for tag in tags}
+            def has_tag(tmpl):
+                tmpl_tags = {str(x).lower() for x in tmpl.tags}
+                return bool(want & tmpl_tags)
+            templates = [t for t in templates if has_tag(t)]
         
         return templates
     
@@ -285,14 +297,21 @@ class TemplateManager:
         """Increment usage count for a template"""
         if template_id in self._templates:
             self._templates[template_id].usage_count += 1
-            from datetime import datetime
-            self._templates[template_id].last_used = datetime.utcnow().isoformat()
+            self._templates[template_id].last_used = datetime.utcnow()
     
     def get_popular_templates(self, limit: int = 5) -> List[SessionTemplate]:
         """Get most popular templates by usage count"""
         templates = list(self._templates.values())
         templates.sort(key=lambda t: t.usage_count, reverse=True)
         return templates[:limit]
+
+    # --- helpers ---
+    def allowed_for_user(self, tmpl: SessionTemplate, user_type: UserType) -> bool:
+        return user_type in tmpl.user_types and (tmpl.is_public or tmpl.created_by is not None)
+
+    def for_user(self, user_type: UserType, *, category: Optional[TemplateCategory] = None) -> List[SessionTemplate]:
+        items = self.list_templates(category=category, user_type=user_type)
+        return [t for t in items if self.allowed_for_user(t, user_type)]
 
 
 # Global template manager instance

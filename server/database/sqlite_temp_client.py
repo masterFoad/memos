@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 import json
+import ast
 
 from .base import (
     CompleteDatabaseInterface,
@@ -55,8 +56,14 @@ class SQLiteTempClient(CompleteDatabaseInterface):
                 self._connection = await aiosqlite.connect(str(self.db_path))
                 self._connection.row_factory = aiosqlite.Row
                 
+                # Reliability / concurrency
+                await self._connection.execute("PRAGMA foreign_keys = ON;")
+                await self._connection.execute("PRAGMA journal_mode = WAL;")
+                
                 # Initialize database schema
                 await self._create_tables()
+                # Apply idempotent migrations/alterations
+                await self._run_migrations()
                 
                 logger.info(f"Connected to SQLite database: {self.db_path}")
                 return True
@@ -257,19 +264,270 @@ class SQLiteTempClient(CompleteDatabaseInterface):
         await self._connection.commit()
         logger.info("Database tables created successfully")
     
+    async def _column_exists(self, table_name: str, column_name: str) -> bool:
+        """Check if a column exists in a table."""
+        try:
+            async with self._connection.execute(f"PRAGMA table_info({table_name});") as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    if dict(row).get("name") == column_name:
+                        return True
+            return False
+        except Exception:
+            return False
+
+    async def _index_exists(self, index_name: str) -> bool:
+        """Check if an index exists in the database."""
+        try:
+            async with self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name = ?;",
+                (index_name,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return bool(row)
+        except Exception:
+            return False
+
+    async def _run_migrations(self) -> None:
+        """Run idempotent schema migrations to extend existing tables and add new ones."""
+        # --- Workspaces: identity + default storage references ---
+        workspaces_cols = [
+            ("k8s_namespace", "TEXT"),
+            ("ksa_name", "TEXT"),
+            ("gsa_email", "TEXT"),
+            ("default_bucket_id", "TEXT"),
+            ("default_filestore_id", "TEXT"),
+        ]
+        for col_name, col_type in workspaces_cols:
+            if not await self._column_exists("workspaces", col_name):
+                await self._connection.execute(
+                    f"ALTER TABLE workspaces ADD COLUMN {col_name} {col_type};"
+                )
+
+        # Indices for workspaces
+        if not await self._index_exists("idx_workspaces_user_id"):
+            await self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_workspaces_user_id ON workspaces(user_id);"
+            )
+        if not await self._index_exists("idx_workspaces_namespace"):
+            await self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_workspaces_namespace ON workspaces(k8s_namespace);"
+            )
+
+        # --- Storage resources: link to workspace + state/metadata/mount flags ---
+        storage_cols = [
+            ("workspace_id", "TEXT"),
+            ("state", "TEXT DEFAULT 'active'"),
+            ("metadata", "TEXT"),
+            ("is_default", "BOOLEAN DEFAULT FALSE"),
+            ("auto_mount", "BOOLEAN DEFAULT FALSE"),
+            ("mount_path", "TEXT"),
+            ("access_mode", "TEXT DEFAULT 'RW'"),
+        ]
+        for col_name, col_type in storage_cols:
+            if not await self._column_exists("storage_resources", col_name):
+                await self._connection.execute(
+                    f"ALTER TABLE storage_resources ADD COLUMN {col_name} {col_type};"
+                )
+
+        # Indices for storage_resources
+        if not await self._index_exists("idx_storage_ws"):
+            await self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_storage_ws ON storage_resources(workspace_id);"
+            )
+        if not await self._index_exists("idx_storage_user_type"):
+            await self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_storage_user_type ON storage_resources(user_id, storage_type);"
+            )
+        if not await self._index_exists("idx_storage_default"):
+            await self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_storage_default ON storage_resources(is_default, storage_type, workspace_id);"
+            )
+
+        # --- Sessions: add user_id and indexes, with best-effort backfill ---
+        if not await self._column_exists("sessions", "user_id"):
+            await self._connection.execute(
+                "ALTER TABLE sessions ADD COLUMN user_id TEXT;"
+            )
+            # Backfill from workspaces
+            try:
+                await self._connection.execute(
+                    """
+                    UPDATE sessions
+                    SET user_id = (
+                        SELECT w.user_id FROM workspaces w
+                        WHERE w.workspace_id = sessions.workspace_id
+                    )
+                    WHERE user_id IS NULL;
+                    """
+                )
+            except Exception:
+                # Best-effort; ignore if fails
+                pass
+
+        if not await self._index_exists("idx_sessions_user_id"):
+            await self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);"
+            )
+        if not await self._index_exists("idx_sessions_workspace_id"):
+            await self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_workspace_id ON sessions(workspace_id);"
+            )
+
+        # --- Session attachments table ---
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS session_attachments (
+                session_id TEXT NOT NULL,
+                storage_id TEXT NOT NULL,
+                mount_path TEXT,
+                access_mode TEXT DEFAULT 'RW',
+                attached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                detached_at TIMESTAMP,
+                PRIMARY KEY (session_id, storage_id)
+            )
+            """
+        )
+        if not await self._index_exists("idx_attach_session"):
+            await self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_attach_session ON session_attachments(session_id);"
+            )
+        if not await self._index_exists("idx_attach_storage"):
+            await self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_attach_storage ON session_attachments(storage_id);"
+            )
+
+        # --- Catalog and billing tables (products, prices, orders, subscriptions, invoices, ledger) ---
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS products (
+                product_id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,            -- bucket|filestore|template|session_tier
+                name TEXT NOT NULL,
+                description TEXT,
+                metadata TEXT,                -- JSON
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS prices (
+                price_id TEXT PRIMARY KEY,
+                product_id TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                one_time_cents INTEGER DEFAULT 0,
+                monthly_cents INTEGER DEFAULT 0,
+                unit TEXT,                    -- GB|INSTANCE|TIER
+                unit_amount INTEGER,          -- e.g., size for GB pricing
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        if not await self._index_exists("idx_prices_product"):
+            await self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_prices_product ON prices(product_id);"
+            )
+
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS purchase_orders (
+                order_id TEXT PRIMARY KEY,
+                buyer_user_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                product_id TEXT NOT NULL,
+                price_id TEXT NOT NULL,
+                quantity INTEGER DEFAULT 1,
+                state TEXT NOT NULL DEFAULT 'pending',   -- pending|provisioning|active|failed|cancelled
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        if not await self._index_exists("idx_orders_workspace"):
+            await self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_orders_workspace ON purchase_orders(workspace_id);"
+            )
+
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                subscription_id TEXT PRIMARY KEY,
+                order_id TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                product_id TEXT NOT NULL,
+                price_id TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'active',    -- active|past_due|canceled
+                current_period_start TIMESTAMP,
+                current_period_end TIMESTAMP,
+                cancel_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        if not await self._index_exists("idx_subs_workspace"):
+            await self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_subs_workspace ON subscriptions(workspace_id);"
+            )
+        if not await self._index_exists("idx_subs_order"):
+            await self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_subs_order ON subscriptions(order_id);"
+            )
+
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS invoices (
+                invoice_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                period_start TIMESTAMP NOT NULL,
+                period_end TIMESTAMP NOT NULL,
+                total_cents INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',     -- open|paid|void
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        if not await self._index_exists("idx_invoices_workspace"):
+            await self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_invoices_workspace ON invoices(workspace_id);"
+            )
+
+        await self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ledger_entries (
+                entry_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                kind TEXT NOT NULL,            -- one_time|recurring|usage
+                product_id TEXT,
+                amount_cents INTEGER NOT NULL,
+                metadata TEXT,                 -- JSON
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        if not await self._index_exists("idx_ledger_workspace"):
+            await self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ledger_workspace ON ledger_entries(workspace_id);"
+            )
+
+        # Finalize migration
+        await self._connection.commit()
+    
     async def _execute_query(self, query: str, params: Tuple = ()) -> List[Dict[str, Any]]:
         """Execute a query and return results as list of dictionaries"""
         async with self._lock:
-            cursor = await self._connection.execute(query, params)
-            rows = await cursor.fetchall()
-            return [self._convert_datetime_fields(dict(row)) for row in rows]
+            async with self._connection.execute(query, params) as cursor:
+                rows = await cursor.fetchall()
+                return [self._convert_datetime_fields(dict(row)) for row in rows]
     
     async def _execute_single(self, query: str, params: Tuple = ()) -> Optional[Dict[str, Any]]:
         """Execute a query and return single result"""
         async with self._lock:
-            cursor = await self._connection.execute(query, params)
-            row = await cursor.fetchone()
-            return self._convert_datetime_fields(dict(row)) if row else None
+            async with self._connection.execute(query, params) as cursor:
+                row = await cursor.fetchone()
+                return self._convert_datetime_fields(dict(row)) if row else None
     
     async def _execute_update(self, query: str, params: Tuple = ()) -> bool:
         """Execute an update/insert query"""
@@ -312,7 +570,7 @@ class SQLiteTempClient(CompleteDatabaseInterface):
                         row[field] = json.loads(row[field])
                     else:
                         # Handle legacy format where lists were stored as string representation
-                        row[field] = eval(row[field]) if row[field] != '[]' else []
+                        row[field] = ast.literal_eval(row[field]) if row[field] != '[]' else []
                 except (ValueError, TypeError, SyntaxError):
                     # Keep as string if parsing fails
                     pass
@@ -928,7 +1186,7 @@ class SQLiteTempClient(CompleteDatabaseInterface):
                     import json
                     set_clauses.append(f"{key} = ?")
                     params.append(json.dumps(value))
-                elif key in ['provider', 'status']:
+                elif key in ['provider', 'status', 'user_id']:
                     set_clauses.append(f"{key} = ?")
                     params.append(value)
             
@@ -1039,8 +1297,15 @@ class SQLiteTempClient(CompleteDatabaseInterface):
             user_type = UserType(user['user_type'])
             limits = await self.get_user_tier_limits(user_type)
             
+            # Normalize key names to the limits map
+            key = (
+                "buckets" if storage_type == StorageType.GCS_BUCKET
+                else "filestores" if storage_type == StorageType.FILESTORE_PVC
+                else storage_type.value
+            )
+            
             # Check if unlimited
-            if limits.get(storage_type.value, 0) == -1:
+            if limits.get(key, 0) == -1:
                 return True
             
             # Count current resources
@@ -1048,7 +1313,7 @@ class SQLiteTempClient(CompleteDatabaseInterface):
             result = await self._execute_single(query, (user_id, storage_type.value))
             current_count = result['count'] if result else 0
             
-            return current_count < limits.get(storage_type.value, 0)
+            return current_count < limits.get(key, 0)
             
         except Exception as e:
             logger.error(f"Error checking user storage quota: {e}")
@@ -1101,13 +1366,15 @@ class SQLiteTempClient(CompleteDatabaseInterface):
             if user_credits < space['cost_usd']:
                 raise Exception(f"Insufficient credits: {user_credits} < {space['cost_usd']}")
             
-            # Start transaction
+            # Deduct credits first (handles its own locking/transaction)
+            success = await self.deduct_credits(
+                user_id, space['cost_usd'], f"Space purchase: {space['name']}"
+            )
+            if not success:
+                raise Exception("Failed to deduct credits")
+
+            # Now do the remaining writes under a single lock
             async with self._lock:
-                # Deduct credits
-                success = await self.deduct_credits(user_id, space['cost_usd'], f"Space purchase: {space['name']}")
-                if not success:
-                    raise Exception("Failed to deduct credits")
-                
                 # Create user space instance
                 user_space_id = str(uuid.uuid4())
                 query = """
@@ -1148,3 +1415,227 @@ class SQLiteTempClient(CompleteDatabaseInterface):
         except Exception as e:
             logger.error(f"Error getting workspace spaces: {e}")
             return []
+    
+    # ============================================================================
+    # Session Management Helpers
+    # ============================================================================
+
+    async def update_session_status(self, session_id: str, status: str) -> bool:
+        """Update session status"""
+        try:
+            query = """
+                UPDATE sessions 
+                SET status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+            """
+            return await self._execute_update(query, (status, session_id))
+        except Exception as e:
+            logger.error(f"Error updating session status: {e}")
+            return False
+    
+    async def list_sessions(self, workspace_id: str = None) -> List[Dict[str, Any]]:
+        """List sessions, optionally filtered by workspace"""
+        try:
+            if workspace_id:
+                query = "SELECT * FROM sessions WHERE workspace_id = ? ORDER BY created_at DESC"
+                return await self._execute_query(query, (workspace_id,))
+            else:
+                query = "SELECT * FROM sessions ORDER BY created_at DESC"
+                return await self._execute_query(query)
+        except Exception as e:
+            logger.error(f"Error listing sessions: {e}")
+            return []
+
+    # ==========================================================================
+    # Helpers for Workspace Defaults and Storage Attachments
+    # ==========================================================================
+
+    async def assign_storage_to_workspace(self, resource_id: str, workspace_id: str) -> bool:
+        """Associate an existing storage resource to a workspace."""
+        try:
+            query = "UPDATE storage_resources SET workspace_id = ? WHERE resource_id = ?"
+            return await self._execute_update(query, (workspace_id, resource_id))
+        except Exception as e:
+            logger.error(f"Error assigning storage to workspace: {e}")
+            return False
+
+    async def set_workspace_default_storage(self, workspace_id: str, resource_id: str) -> bool:
+        """Set a storage resource as the default bucket or filestore for a workspace."""
+        try:
+            resource = await self._execute_single(
+                "SELECT resource_id, storage_type, workspace_id FROM storage_resources WHERE resource_id = ?",
+                (resource_id,)
+            )
+            if not resource or resource.get("workspace_id") != workspace_id:
+                return False
+
+            storage_type = resource.get("storage_type")
+            if storage_type not in (StorageType.GCS_BUCKET.value, StorageType.FILESTORE_PVC.value):
+                return False
+
+            async with self._lock:
+                if storage_type == StorageType.GCS_BUCKET.value:
+                    await self._connection.execute(
+                        "UPDATE workspaces SET default_bucket_id = ? WHERE workspace_id = ?",
+                        (resource_id, workspace_id)
+                    )
+                    await self._connection.execute(
+                        "UPDATE storage_resources SET is_default = FALSE WHERE workspace_id = ? AND storage_type = ?",
+                        (workspace_id, StorageType.GCS_BUCKET.value)
+                    )
+                else:
+                    await self._connection.execute(
+                        "UPDATE workspaces SET default_filestore_id = ? WHERE workspace_id = ?",
+                        (resource_id, workspace_id)
+                    )
+                    await self._connection.execute(
+                        "UPDATE storage_resources SET is_default = FALSE WHERE workspace_id = ? AND storage_type = ?",
+                        (workspace_id, StorageType.FILESTORE_PVC.value)
+                    )
+                await self._connection.execute(
+                    "UPDATE storage_resources SET is_default = TRUE WHERE resource_id = ?",
+                    (resource_id,)
+                )
+                await self._connection.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error setting workspace default storage: {e}")
+            return False
+
+    async def update_storage_flags(self, resource_id: str, is_default: Optional[bool] = None,
+                                   auto_mount: Optional[bool] = None, mount_path: Optional[str] = None,
+                                   access_mode: Optional[str] = None) -> bool:
+        """Update storage flags and handle default switching consistently."""
+        try:
+            resource = await self._execute_single(
+                "SELECT resource_id, storage_type, workspace_id FROM storage_resources WHERE resource_id = ?",
+                (resource_id,)
+            )
+            if not resource:
+                return False
+
+            updates = []
+            params = []
+            if auto_mount is not None:
+                updates.append("auto_mount = ?")
+                params.append(1 if auto_mount else 0)
+            if mount_path is not None:
+                updates.append("mount_path = ?")
+                params.append(mount_path)
+            if access_mode is not None:
+                updates.append("access_mode = ?")
+                params.append(access_mode)
+
+            if updates:
+                params.append(resource_id)
+                await self._execute_update(
+                    f"UPDATE storage_resources SET {', '.join(updates)} WHERE resource_id = ?",
+                    tuple(params)
+                )
+
+            if is_default is not None:
+                if is_default:
+                    return await self.set_workspace_default_storage(resource["workspace_id"], resource_id)
+                else:
+                    await self._execute_update(
+                        "UPDATE storage_resources SET is_default = FALSE WHERE resource_id = ?",
+                        (resource_id,)
+                    )
+                    if resource.get("storage_type") == StorageType.GCS_BUCKET.value:
+                        await self._execute_update(
+                            "UPDATE workspaces SET default_bucket_id = NULL WHERE workspace_id = ? AND default_bucket_id = ?",
+                            (resource["workspace_id"], resource_id)
+                        )
+                    else:
+                        await self._execute_update(
+                            "UPDATE workspaces SET default_filestore_id = NULL WHERE workspace_id = ? AND default_filestore_id = ?",
+                            (resource["workspace_id"], resource_id)
+                        )
+            return True
+        except Exception as e:
+            logger.error(f"Error updating storage flags: {e}")
+            return False
+
+    async def list_workspace_storage(self, workspace_id: str) -> List[Dict[str, Any]]:
+        """List all storage resources attached to a workspace."""
+        try:
+            query = (
+                "SELECT * FROM storage_resources WHERE workspace_id = ? ORDER BY created_at DESC"
+            )
+            return await self._execute_query(query, (workspace_id,))
+        except Exception as e:
+            logger.error(f"Error listing workspace storage: {e}")
+            return []
+
+    async def attach_session_storage(self, session_id: str, storage_id: str,
+                                     mount_path: Optional[str] = None, access_mode: str = "RW") -> bool:
+        """Attach a storage resource to a session."""
+        try:
+            query = (
+                "INSERT OR REPLACE INTO session_attachments (session_id, storage_id, mount_path, access_mode)"
+                " VALUES (?, ?, ?, ?)"
+            )
+            return await self._execute_update(query, (session_id, storage_id, mount_path, access_mode))
+        except Exception as e:
+            logger.error(f"Error attaching session storage: {e}")
+            return False
+
+    async def detach_session_storage(self, session_id: str, storage_id: str) -> bool:
+        """Mark a storage attachment as detached for a session."""
+        try:
+            query = (
+                "UPDATE session_attachments SET detached_at = CURRENT_TIMESTAMP WHERE session_id = ? AND storage_id = ?"
+            )
+            return await self._execute_update(query, (session_id, storage_id))
+        except Exception as e:
+            logger.error(f"Error detaching session storage: {e}")
+            return False
+
+    async def list_session_attachments(self, session_id: str) -> List[Dict[str, Any]]:
+        """List storage resources attached to a session."""
+        try:
+            query = "SELECT * FROM session_attachments WHERE session_id = ? ORDER BY attached_at DESC"
+            return await self._execute_query(query, (session_id,))
+        except Exception as e:
+            logger.error(f"Error listing session attachments: {e}")
+            return []
+
+    async def get_workspace_defaults(self, workspace_id: str) -> Dict[str, Any]:
+        """Return default bucket and filestore resources for a workspace, if any."""
+        try:
+            # Prefer explicit default ids on workspaces if present
+            ws = await self._execute_single(
+                "SELECT default_bucket_id, default_filestore_id FROM workspaces WHERE workspace_id = ?",
+                (workspace_id,)
+            )
+            result: Dict[str, Any] = {"bucket": None, "filestore": None}
+            if ws:
+                if ws.get("default_bucket_id"):
+                    b = await self._execute_single(
+                        "SELECT * FROM storage_resources WHERE resource_id = ?",
+                        (ws["default_bucket_id"],)
+                    )
+                    result["bucket"] = b
+                if ws.get("default_filestore_id"):
+                    f = await self._execute_single(
+                        "SELECT * FROM storage_resources WHERE resource_id = ?",
+                        (ws["default_filestore_id"],)
+                    )
+                    result["filestore"] = f
+            # Fallback: find by is_default flags if workspace columns are unset
+            if result["bucket"] is None:
+                b = await self._execute_single(
+                    "SELECT * FROM storage_resources WHERE workspace_id = ? AND storage_type = ? AND is_default = TRUE LIMIT 1",
+                    (workspace_id, StorageType.GCS_BUCKET.value)
+                )
+                result["bucket"] = b
+            if result["filestore"] is None:
+                f = await self._execute_single(
+                    "SELECT * FROM storage_resources WHERE workspace_id = ? AND storage_type = ? AND is_default = TRUE LIMIT 1",
+                    (workspace_id, StorageType.FILESTORE_PVC.value)
+                )
+                result["filestore"] = f
+            return result
+        except Exception as e:
+            logger.error(f"Error getting workspace defaults: {e}")
+            return {"bucket": None, "filestore": None}

@@ -47,11 +47,16 @@ class GPUType(str, Enum):
 class ImageType(str, Enum):
     """Container image types"""
     ALPINE_BASIC = "alpine_basic"
-    UBUNTU_BASIC = "ubuntu_basic"
-    PYTHON_DEV = "python_dev"
-    NODEJS_DEV = "nodejs_dev"
-    DATA_SCIENCE = "data_science"
-    ML_TRAINING = "ml_training"
+    PYTHON_BASIC = "python_basic"
+    UBUNTU_PRO = "ubuntu_pro"
+    PYTHON_PRO = "python_pro"
+    NODEJS_PRO = "nodejs_pro"
+    GO_PRO = "go_pro"
+    RUST_PRO = "rust_pro"
+    PYTHON_ENTERPRISE = "python_enterprise"
+    JUPYTER_ENTERPRISE = "jupyter_enterprise"
+    CUDA_ENTERPRISE = "cuda_enterprise"
+    JAVA_ENTERPRISE = "java_enterprise"
     CUSTOM = "custom"
 
 
@@ -73,6 +78,14 @@ class SessionStatus(str, Enum):
     ERROR = "error"
 
 
+class SessionProvider(str, Enum):
+    """Session provider options"""
+    CLOUD_RUN = "cloud_run"
+    GKE = "gke"
+    # NOTE: WORKSTATIONS removed - only Cloud Run and GKE Autopilot supported
+    AUTO = "auto"
+
+
 class MountType(str, Enum):
     """Storage mount types"""
     GCS_BUCKET = "gcs_bucket"
@@ -84,9 +97,10 @@ class TemplateCategory(str, Enum):
     """Template categories"""
     DEVELOPMENT = "development"
     DATA_SCIENCE = "data_science"
+    WEB_DEVELOPMENT = "web_development"
     MACHINE_LEARNING = "machine_learning"
     TESTING = "testing"
-    PRODUCTION = "production"
+    CUSTOM = "custom"
 
 
 class CostEstimate(OnMemOSModel):

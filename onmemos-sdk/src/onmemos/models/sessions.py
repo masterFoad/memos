@@ -2,16 +2,27 @@
 Session models for OnMemOS SDK
 """
 
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from pydantic import BaseModel, Field, validator
 from datetime import datetime
 
-from .base import OnMemOSModel, ResourceTier, StorageType, GPUType, ImageType, SessionStatus
+from .base import OnMemOSModel, ResourceTier, StorageType, GPUType, ImageType, SessionStatus, SessionProvider
+from .storage import StorageConfig
 
 
 class CreateSessionRequest(OnMemOSModel):
     """Request model for creating a session"""
-    template_id: Optional[str] = Field(None, description="Template to use")
+    # Required fields for server compatibility
+    template: str = Field(..., description="Template name")
+    namespace: str = Field(..., description="Namespace for the session")
+    user: str = Field(..., description="User creating the session")
+    workspace_id: str = Field(..., description="Workspace ID")
+    
+    # Provider selection
+    provider: SessionProvider = Field(SessionProvider.AUTO, description="Session provider")
+    
+    # Optional fields
+    template_id: Optional[str] = Field(None, description="Template ID to use")
     resource_tier: ResourceTier = Field(ResourceTier.MEDIUM, description="Resource allocation")
     storage_type: StorageType = Field(StorageType.EPHEMERAL, description="Storage type")
     storage_size_gb: int = Field(0, ge=0, description="Storage size in GB")
@@ -20,6 +31,14 @@ class CreateSessionRequest(OnMemOSModel):
     ttl_minutes: int = Field(60, ge=1, le=1440, description="Session TTL in minutes")
     env_vars: Dict[str, str] = Field(default_factory=dict, description="Environment variables")
     labels: Dict[str, str] = Field(default_factory=dict, description="Session labels")
+    
+    # Provider selection flags (these determine which provider gets chosen)
+    long_lived: bool = Field(False, description="Force long-lived provider (GKE) - for sessions >1 hour")
+    needs_ssh: bool = Field(False, description="Requires SSH/WebSocket access - forces GKE provider")
+    expected_duration_minutes: Optional[int] = Field(None, description="Expected session duration - >60min forces GKE")
+    
+    # Storage configuration (matches server implementation)
+    storage_config: Optional[Union[StorageConfig, Dict[str, Any]]] = Field(None, description="Storage configuration")
     request_bucket: bool = Field(False, description="Request GCS bucket")
     bucket_size_gb: Optional[int] = Field(None, ge=1, description="Bucket size in GB")
     request_persistent_storage: bool = Field(False, description="Request persistent storage")
@@ -42,33 +61,52 @@ class CreateSessionRequest(OnMemOSModel):
 
 
 class Session(OnMemOSModel):
-    """Session model"""
-    session_id: str = Field(..., description="Unique session identifier")
+    """Session model - matches server response"""
+    # Core fields from server response
+    id: str = Field(..., description="Unique session identifier")
+    provider: str = Field(..., description="Session provider (gke, cloud_run, etc.)")
+    namespace: str = Field(..., description="Namespace for the session")
+    user: str = Field(..., description="User who created the session")
     workspace_id: str = Field(..., description="Associated workspace ID")
-    user_id: str = Field(..., description="User who created the session")
-    status: SessionStatus = Field(..., description="Current session status")
-    resource_tier: ResourceTier = Field(..., description="Resource allocation")
-    storage_type: StorageType = Field(..., description="Storage configuration")
-    gpu_type: GPUType = Field(..., description="GPU configuration")
-    image_type: ImageType = Field(..., description="Container image type")
-    created_at: datetime = Field(..., description="Creation timestamp")
-    started_at: Optional[datetime] = Field(None, description="Start timestamp")
-    stopped_at: Optional[datetime] = Field(None, description="Stop timestamp")
-    ttl_minutes: int = Field(..., description="Session TTL")
-    env_vars: Dict[str, str] = Field(default_factory=dict, description="Environment variables")
-    labels: Dict[str, str] = Field(default_factory=dict, description="Session labels")
-    cost_per_hour: float = Field(..., description="Hourly cost")
-    total_cost: float = Field(0.0, description="Total cost so far")
-    template_id: Optional[str] = Field(None, description="Template used")
+    status: str = Field(..., description="Current session status")
+    url: Optional[str] = Field(None, description="Session URL")
+    websocket: Optional[str] = Field(None, description="WebSocket endpoint")
+    ssh: Optional[bool] = Field(False, description="SSH enabled")
     
-    # GKE-specific fields
+    # Optional fields that may be null
+    user_type: Optional[str] = Field(None, description="User type")
+    storage_allocation: Optional[Dict[str, Any]] = Field(None, description="Storage allocation")
+    storage_config: Optional[Dict[str, Any]] = Field(None, description="Storage configuration")
+    resource_tier: Optional[str] = Field(None, description="Resource allocation tier")
+    resource_package: Optional[str] = Field(None, description="Resource package")
+    resource_spec: Optional[Dict[str, Any]] = Field(None, description="Resource specification")
+    image_spec: Optional[Dict[str, Any]] = Field(None, description="Image specification")
+    gpu_spec: Optional[Dict[str, Any]] = Field(None, description="GPU specification")
+    created_at: Optional[Union[float, str, datetime]] = Field(None, description="Creation timestamp (float) or datetime string")
+    expires_at: Optional[Union[float, str, datetime]] = Field(None, description="Expiration timestamp (float) or datetime string")
+    
+    # Provider-specific fields
     k8s_namespace: Optional[str] = Field(None, description="Kubernetes namespace")
     pod_name: Optional[str] = Field(None, description="Pod name")
-    node_name: Optional[str] = Field(None, description="Node name")
+    service_name: Optional[str] = Field(None, description="Service name")
+    job_name: Optional[str] = Field(None, description="Job name")
     
-    # Storage fields
-    bucket_name: Optional[str] = Field(None, description="GCS bucket name")
-    persistent_volume_name: Optional[str] = Field(None, description="Persistent volume name")
+    # Storage status
+    storage_status: Dict[str, Any] = Field(default_factory=dict, description="Storage status")
+    
+    # Details object
+    details: Optional[Dict[str, Any]] = Field(None, description="Session details")
+    
+    # Computed properties
+    @property
+    def session_id(self) -> str:
+        """Alias for id field"""
+        return self.id
+    
+    @property
+    def user_id(self) -> str:
+        """Alias for user field"""
+        return self.user
     
     @property
     def is_active(self) -> bool:
@@ -101,6 +139,25 @@ class Session(OnMemOSModel):
         """Estimate total cost based on duration and hourly rate"""
         hours = self.duration_minutes / 60.0
         return hours * self.cost_per_hour
+    
+    @validator('created_at', 'expires_at', pre=True)
+    def convert_datetime_to_timestamp(cls, v):
+        """Convert datetime strings to timestamps if needed"""
+        if v is None:
+            return v
+        if isinstance(v, (int, float)):
+            return v
+        if isinstance(v, str):
+            try:
+                # Try to parse ISO format datetime string
+                dt = datetime.fromisoformat(v.replace('Z', '+00:00'))
+                return dt.timestamp()
+            except ValueError:
+                # If parsing fails, return as-is
+                return v
+        if isinstance(v, datetime):
+            return v.timestamp()
+        return v
 
 
 class SessionList(OnMemOSModel):

@@ -149,30 +149,44 @@ async def quick_session(
     **kwargs
 ):
     """Quick session creation with auto-cleanup"""
-    async with client(api_key=api_key, base_url=base_url) as client:
+    async with client(api_key=api_key, base_url=base_url) as sdk_client:
+        # Create session request
+        from ..models.sessions import CreateSessionRequest, ResourceTier
+        
+        session_request = CreateSessionRequest(
+            template=template_id,
+            namespace=kwargs.get('namespace', 'sdk-demo'),
+            user=kwargs.get('user', 'sdk-test-user'),
+            workspace_id=kwargs.get('workspace_id', '5e3f6ebb-6656-4301-be47-5436646ba44e'),
+            template_id=template_id,
+            resource_tier=kwargs.get('resource_tier', ResourceTier.MEDIUM),
+            ttl_minutes=kwargs.get('ttl_minutes', 60)
+        )
+        
         # Create session
-        session = await client.sessions.create_session(template_id=template_id, **kwargs)
+        session = await sdk_client.sessions.create_session(session_request)
         
         try:
             # Wait for session to be ready
-            await client.sessions.wait_for_ready(session.session_id)
+            await sdk_client.sessions.wait_for_ready(session.session_id)
             
             # Return session info
             return {
                 "session_id": session.session_id,
-                "shell_url": client.get_shell_url(
+                "shell_url": sdk_client.get_shell_url(
                     session.session_id,
                     session.k8s_namespace or "default",
                     session.pod_name or "unknown"
                 ),
-                "session_url": client.get_session_url(session.session_id),
-                "storage_url": client.get_storage_url(session.session_id)
+                "session_url": sdk_client.get_session_url(session.session_id),
+                "storage_url": sdk_client.get_storage_url(session.session_id),
+                "status": session.status
             }
         
         except Exception as e:
             # Cleanup on error
             try:
-                await client.sessions.delete_session(session.session_id)
+                await sdk_client.sessions.delete_session(session.session_id)
             except:
                 pass
             raise e
@@ -181,20 +195,20 @@ async def quick_session(
 # Example usage functions
 async def list_my_sessions(api_key: Optional[str] = None) -> list:
     """List user's sessions"""
-    async with client(api_key=api_key) as client:
-        sessions = await client.sessions.list_sessions()
+    async with client(api_key=api_key) as sdk_client:
+        sessions = await sdk_client.sessions.list_sessions()
         return [s.dict() for s in sessions.sessions]
 
 
 async def get_session_info(session_id: str, api_key: Optional[str] = None) -> dict:
     """Get session information"""
-    async with client(api_key=api_key) as client:
-        session = await client.sessions.get_session(session_id)
+    async with client(api_key=api_key) as sdk_client:
+        session = await sdk_client.sessions.get_session(session_id)
         return session.dict()
 
 
 async def estimate_template_cost(template_id: str, duration_hours: float = 1.0, api_key: Optional[str] = None) -> dict:
     """Estimate cost for a template"""
-    async with client(api_key=api_key) as client:
-        estimate = await client.cost_estimation.estimate_template_cost(template_id, duration_hours)
+    async with client(api_key=api_key) as sdk_client:
+        estimate = await sdk_client.cost_estimation.estimate_template_cost(template_id, duration_hours)
         return estimate.dict()

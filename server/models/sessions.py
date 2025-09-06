@@ -10,7 +10,7 @@ from .users import UserType, WorkspaceStorageRequest, WorkspaceStorageAllocation
 class SessionProvider(str, Enum):
     cloud_run = "cloud_run"
     gke = "gke"
-    workstations = "workstations"
+    # NOTE: workstations removed - only Cloud Run and GKE Autopilot supported
     auto = "auto"
 
 
@@ -531,7 +531,7 @@ class SessionInfo(BaseModel):
     user: str
     workspace_id: str = Field(description="Workspace identifier")
     status: str
-    url: Optional[str] = None       # service URL or workstation URL
+    url: Optional[str] = None       # service URL (Cloud Run or GKE)
     websocket: Optional[str] = None # where relevant
     ssh: Optional[bool] = None
     details: Dict[str, Any] = Field(default_factory=dict)

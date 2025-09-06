@@ -90,6 +90,15 @@ def get_database_client() -> DatabaseInterface:
     
     return _db_client
 
+async def get_database_client_async() -> DatabaseInterface:
+    """Get the global database client instance (async version)"""
+    global _db_client
+    
+    if _db_client is None:
+        _db_client = DatabaseFactory.create_database_client()
+    
+    return _db_client
+
 async def initialize_database() -> bool:
     """Initialize the database connection"""
     global _db_client

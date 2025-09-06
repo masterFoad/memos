@@ -12,8 +12,8 @@ from .sessions import (
     SessionMetrics, SessionLogs
 )
 from .storage import (
-    MountRequest, Mount, MountList, FileInfo, FileList,
-    UploadRequest, DownloadRequest, StorageUsage, BucketInfo, FilestoreInfo
+    StorageConfig, AdditionalStorage, StorageType, StorageClass,
+    create_persistent_storage_config, create_gcs_storage_config, create_multi_storage_config
 )
 from .templates import (
     SessionTemplate, TemplateList, TemplateCategoryInfo,
@@ -46,16 +46,13 @@ __all__ = [
     "SessionLogs",
     
     # Storage models
-    "MountRequest",
-    "Mount",
-    "MountList",
-    "FileInfo",
-    "FileList",
-    "UploadRequest",
-    "DownloadRequest",
-    "StorageUsage",
-    "BucketInfo",
-    "FilestoreInfo",
+    "StorageConfig",
+    "AdditionalStorage",
+    "StorageType",
+    "StorageClass",
+    "create_persistent_storage_config",
+    "create_gcs_storage_config",
+    "create_multi_storage_config",
     
     # Template models
     "SessionTemplate",

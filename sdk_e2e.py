@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""
+Starbase SDK E2E: admin bootstrap via REST, user flow via SDK
+
+Steps:
+ 1) Admin (X-API-Key): create user, passport, add credits, create dock (workspace)
+ 2) User (SDK with Passport): launch shuttle, wait running, execute commands, cleanup
+
+Requires: pip install -e starbase/ (already installed)
+"""
+import os
+import sys
+import time
+import json
+import argparse
+from typing import Any, Dict, Optional
+
+import requests
+from starbase import Starbase
+try:
+    from websocket import create_connection  # type: ignore
+except Exception:
+    create_connection = None
+
+
+class ApiError(RuntimeError):
+    pass
+
+
+def _h_admin(ikey: str) -> Dict[str, str]:
+    return {"Content-Type": "application/json", "X-API-Key": ikey}
+
+
+def _req(method: str, url: str, headers: Dict[str, str], **kw) -> Dict[str, Any]:
+    timeout = kw.pop("timeout", (5, 60))
+    r = requests.request(method, url, headers=headers, timeout=timeout, **kw)
+    if r.status_code // 100 != 2:
+        raise ApiError(f"{method} {url} -> {r.status_code} {r.text}")
+    if not r.text:
+        return {}
+    try:
+        return r.json()
+    except ValueError:
+        return {"raw": r.text}
+
+
+def admin_create_user(host: str, ikey: str, email: str, name: Optional[str]) -> Dict[str, Any]:
+    url = f"{host}/v1/admin/users"
+    body = {"email": email, "name": name, "user_type": "pro"}
+    return _req("POST", url, _h_admin(ikey), data=json.dumps(body))
+
+
+def admin_create_passport(host: str, ikey: str, user_id: str) -> Dict[str, Any]:
+    url = f"{host}/v1/admin/passports"
+    body = {"user_id": user_id, "name": "default", "permissions": []}
+    return _req("POST", url, _h_admin(ikey), data=json.dumps(body))
+
+
+def admin_add_credits(host: str, ikey: str, user_id: str, amount: float) -> Dict[str, Any]:
+    url = f"{host}/v1/admin/credits/add"
+    body = {"user_id": user_id, "amount": amount, "source": "sdk_e2e", "description": "bootstrap credits"}
+    return _req("POST", url, _h_admin(ikey), data=json.dumps(body))
+
+
+def admin_create_workspace(host: str, ikey: str, user_id: str, name: str) -> Dict[str, Any]:
+    url = f"{host}/v1/admin/workspaces"
+    body = {"user_id": user_id, "name": name, "resource_package": "dev_small", "description": "sdk e2e"}
+    return _req("POST", url, _h_admin(ikey), data=json.dumps(body))
+
+
+def wait_until_running(sb: Starbase, sid: str, timeout_s: int = 300) -> Dict[str, Any]:
+    deadline = time.time() + timeout_s
+    last = None
+    while time.time() < deadline:
+        try:
+            s = sb.shuttles.get(sid)
+            last = s
+            if (s.status or "").lower() in ("running", "ready", "active"):
+                return s.__dict__
+        except Exception:
+            pass
+        time.sleep(4)
+    return (last.__dict__ if last else {})
+
+
+def main():
+    p = argparse.ArgumentParser(description="Starbase SDK E2E")
+    p.add_argument("--host", default=os.getenv("ONMEM_HOST", "http://127.0.0.1:8080"))
+    p.add_argument("--internal-key", default=os.getenv("ONMEM_INTERNAL_KEY", "onmemos-internal-key-2024-secure"))
+    p.add_argument("--email", required=True)
+    p.add_argument("--name", default=None)
+    p.add_argument("--credits", type=float, default=25.0)
+    p.add_argument("--provider", default="gke", choices=["gke", "cloud_run"])
+    p.add_argument("--use-vault", action="store_true")
+    p.add_argument("--vault-size", type=int, default=10)
+    p.add_argument("--use-drive", action="store_true")
+    p.add_argument("--drive-size", type=int, default=10)
+    p.add_argument("--keep", action="store_true")
+    p.add_argument("--interactive", action="store_true", help="Open interactive WS shell after launch")
+    args = p.parse_args()
+
+    host = args.host.rstrip("/")
+    ikey = args.internal_key
+
+    print("[1] Admin: create user")
+    u = admin_create_user(host, ikey, args.email, args.name).get("user")
+    user_id = u.get("user_id") or u.get("id")
+    print("    user_id=", user_id)
+
+    print("[2] Admin: create passport")
+    pp = admin_create_passport(host, ikey, user_id)
+    passport = pp.get("passport_key") or pp.get("passport") or pp.get("key")
+    print("    passport=", (passport or "")[:8] + "...")
+
+    if args.credits > 0:
+        print(f"[3] Admin: add credits +{args.credits}")
+        admin_add_credits(host, ikey, user_id, args.credits)
+
+    print("[4] Admin: create dock (workspace)")
+    ws = admin_create_workspace(host, ikey, user_id, name="dev").get("workspace")
+    dock_id = ws.get("workspace_id") or ws.get("id")
+    print("    dock_id=", dock_id)
+
+    print("[5] User: launch shuttle via Starbase")
+    sb = Starbase(base_url=host, api_key=passport, timeout=(5, 600), retries=2)
+    shuttle = sb.shuttles.launch(
+        dock_id=dock_id,
+        provider=args.provider,
+        template_id="dev-python",
+        use_vault=args.use_vault,
+        vault_size_gb=args.vault_size,
+        use_drive=args.use_drive,
+        drive_size_gb=args.drive_size,
+        ttl_minutes=60,
+    )
+    sid = shuttle.id
+    print("    shuttle_id=", sid)
+
+    print("[6] Wait until running")
+    info = wait_until_running(sb, sid)
+    print("    status=", info.get("status"))
+
+    print("[7] Execute commands")
+    for cmd in ["pwd", "ls -la", "echo 'hello from SDK'"]:
+        try:
+            res = sb.shuttles.execute(sid, cmd, timeout_s=60)
+            print(f"$ {cmd}\n{res.stdout}\n---")
+        except Exception as e:
+            print(f"[-] execute failed: {e}")
+
+    if args.interactive:
+        print("[8] Interactive shell (WebSocket)...")
+        if create_connection is None:
+            print("[-] websocket-client not installed. pip install websocket-client")
+        else:
+            try:
+                token = sb.shuttles.ws_token(sid)
+                ns = info.get("launchpad") or info.get("k8s_namespace")
+                pod = info.get("pod") or info.get("pod_name")
+                if not (ns and pod):
+                    # refresh
+                    sref = sb.shuttles.get(sid)
+                    ns = sref.launchpad
+                    pod = sref.pod
+                if not (ns and pod):
+                    print("[-] Could not determine namespace/pod for WS. Skipping.")
+                else:
+                    ws_url = f"{host.replace('http', 'ws')}/v1/gke/shell/{sid}?k8s_ns={ns}&pod={pod}&token={token.token}"
+                    print(f"    connecting: {ws_url}")
+                    ws = create_connection(ws_url)
+                    print("[+] Connected. Type commands, or '/exit' to quit.")
+                    try:
+                        while True:
+                            try:
+                                cmd = input("$ ").strip()
+                            except EOFError:
+                                break
+                            if not cmd:
+                                continue
+                            ws.send(json.dumps({"type": "command", "command": cmd}))
+                            ws.settimeout(10)
+                            try:
+                                msg = ws.recv()
+                                if not msg:
+                                    print("[-] WS closed by server.")
+                                    break
+                                try:
+                                    parsed = json.loads(msg)
+                                except Exception:
+                                    parsed = msg
+                                print(parsed)
+                            except Exception:
+                                pass
+                            if cmd == "/exit":
+                                break
+                    finally:
+                        try:
+                            ws.close()
+                        except Exception:
+                            pass
+            except Exception as e:
+                print(f"[-] WS shell error: {e}")
+
+    if args.keep:
+        print("[9] Keeping shuttle as requested (--keep). Done.")
+        return
+
+    print("[9] Terminate shuttle")
+    try:
+        sb.shuttles.terminate(sid)
+        print("    terminated")
+    except Exception as e:
+        print(f"[-] terminate failed: {e}")
+
+    print("[✓] SDK E2E complete")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except ApiError as e:
+        print(f"[API ERROR] {e}")
+        sys.exit(2)
+    except KeyboardInterrupt:
+        print("\n[ABORTED]")
+        sys.exit(130)
+
+

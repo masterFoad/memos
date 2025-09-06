@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "starbase"
+version = "0.1.0"
+description = "Starbase: User REST Client SDK for OnMemOS"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "OnMemOS", email = "dev@onmemos.local" }]
+dependencies = [
+  "requests>=2.31.0",
+  "typing-extensions>=4.7.0",
+]
+
+[project.urls]
+Homepage = "https://onmemos.local/starbase"
+Repository = "https://onmemos.local/starbase/repo"
+
+

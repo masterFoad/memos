@@ -40,10 +40,9 @@ class CloudRunService:
     def __init__(self) -> None:
         self.project_id: str = os.getenv("PROJECT_ID", "ai-engine-448418")
         self.region: str = os.getenv("REGION", "us-central1")
-        
-        # Initialize Cloud Run client with proper authentication
+
+        # ---------- Cloud Run client (auth fallbacks) ----------
         try:
-            # 1. Try Service Account Key File (Primary method for VM-based services)
             key_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
             if key_file and os.path.exists(key_file):
                 from google.auth import load_credentials_from_file
@@ -51,7 +50,6 @@ class CloudRunService:
                 self.client = run_v2.ServicesClient(credentials=credentials)
                 logger.info(f"✅ CloudRunService using Service Account Key File: {key_file}")
             else:
-                # Fallback to local file
                 key_file = "./service-account-key.json"
                 if key_file and os.path.exists(key_file):
                     from google.auth import load_credentials_from_file
@@ -59,46 +57,42 @@ class CloudRunService:
                     self.client = run_v2.ServicesClient(credentials=credentials)
                     logger.info(f"✅ CloudRunService using local Service Account Key File: {key_file}")
                 else:
-                    raise Exception("No service account key file found")
+                    raise FileNotFoundError("No service account key file found")
         except Exception as e:
             logger.warning(f"Service Account Key failed: {e}")
             try:
-                # 2. Try Workload Identity / Metadata Server (GKE/GCE)
                 from google.auth import default
                 credentials, project = default()
                 self.client = run_v2.ServicesClient(credentials=credentials)
-                logger.info(f"✅ CloudRunService using Workload Identity / Metadata Server authentication")
+                logger.info("✅ CloudRunService using Workload Identity / Metadata Server authentication")
             except Exception as e2:
-                logger.error(f"All authentication methods failed: {e2}")
+                logger.error(f"All authentication methods failed for ServicesClient: {e2}")
                 self.client = run_v2.ServicesClient()
-        
-        # Initialize storage client with proper authentication
+
+        # ---------- Storage client (auth fallbacks) ----------
         try:
-            # 1. Try Service Account Key File (Primary method for VM-based services)
             key_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
             if key_file and os.path.exists(key_file):
                 self.storage_client = storage.Client.from_service_account_json(key_file, project=self.project_id)
                 logger.info(f"✅ CloudRunService storage using Service Account Key File: {key_file}")
             else:
-                # Fallback to local file
                 key_file = "./service-account-key.json"
                 if key_file and os.path.exists(key_file):
                     self.storage_client = storage.Client.from_service_account_json(key_file, project=self.project_id)
                     logger.info(f"✅ CloudRunService storage using local Service Account Key File: {key_file}")
                 else:
-                    raise Exception("No service account key file found")
+                    raise FileNotFoundError("No service account key file found")
         except Exception as e:
-            logger.warning(f"Service Account Key failed: {e}")
+            logger.warning(f"Service Account Key failed for storage: {e}")
             try:
-                # 2. Try Workload Identity / Metadata Server (GKE/GCE)
                 from google.auth import default
                 credentials, project = default()
                 self.storage_client = storage.Client(credentials=credentials, project=project or self.project_id)
-                logger.info(f"✅ CloudRunService storage using Workload Identity / Metadata Server authentication")
+                logger.info("✅ CloudRunService storage using Workload Identity / Metadata Server authentication")
             except Exception as e2:
-                logger.error(f"All authentication methods failed: {e2}")
+                logger.error(f"All authentication methods failed for storage: {e2}")
                 self.storage_client = storage.Client(project=self.project_id)
-        
+
         self.compute_client: compute_v1.DisksClient = compute_v1.DisksClient()
         logger.info("🔧 CloudRunService initialized - Project=%s Region=%s", self.project_id, self.region)
 
@@ -116,15 +110,29 @@ class CloudRunService:
         workspace_id = f"ws-{namespace}-{user}-{int(start)}"
         bucket_name = f"onmemos-{namespace}-{user}-{int(start)}"
 
-        # 1) Bucket with labels
-        bucket = self.storage_client.bucket(bucket_name)
-        bucket.labels = {
-            "onmemos_workspace_id": workspace_id,
-            "namespace": namespace,
-            "user": user,
-        }
-        bucket.create(location=self.region)
-        logger.info("✅ GCS bucket created: %s", bucket_name)
+        # 1) Bucket with labels (robust create)
+        try:
+            bucket = self.storage_client.bucket(bucket_name)
+            bucket.labels = {
+                "onmemos_workspace_id": workspace_id,
+                "namespace": namespace,
+                "user": user,
+            }
+            bucket.create(location=self.region)
+            # Best-effort: enable UBLA + patch labels (older libs may need patch)
+            try:
+                bucket.iam_configuration.uniform_bucket_level_access_enabled = True  # type: ignore[attr-defined]
+                bucket.patch()
+            except Exception:
+                pass
+            logger.info("✅ GCS bucket created: %s", bucket_name)
+        except Exception as e:
+            # If it already exists, proceed; otherwise bubble up
+            if "Already exists" in str(e) or "409" in str(e):
+                logger.warning("Bucket %s already exists; continuing", bucket_name)
+            else:
+                logger.error("❌ Failed to create bucket %s: %s", bucket_name, e)
+                raise
 
         # 2) Service with labels/env
         service_name = f"onmemos-{workspace_id}"
@@ -174,7 +182,7 @@ class CloudRunService:
             if user and ws_user != user:
                 continue
 
-            service_name = svc.name.split("/")[-1]
+            service_name = (svc.name or "").split("/")[-1]
             url = getattr(svc, "uri", "") or getattr(getattr(svc, "status", None), "uri", "") or ""
             items.append(
                 {
@@ -202,7 +210,7 @@ class CloudRunService:
             logger.warning("⚠️  WORKSPACE NOT FOUND: %s", workspace_id)
             return False
 
-        # delete service
+        # delete service (best-effort)
         try:
             subprocess.run(
                 ["gcloud", "run", "services", "delete", ws["service_name"], "--region", self.region, "--quiet"],
@@ -216,7 +224,7 @@ class CloudRunService:
         bucket_name = ws.get("bucket_name") or self._find_bucket_by_label("onmemos_workspace_id", workspace_id)
         if bucket_name:
             try:
-                self.storage_client.bucket(bucket_name).delete(force=True)
+                self._delete_bucket_force(bucket_name)
                 logger.info("🗑️  Deleted GCS bucket: %s", bucket_name)
             except Exception as e:
                 logger.warning("⚠️  Failed to delete bucket %s: %s", bucket_name, e)
@@ -230,54 +238,42 @@ class CloudRunService:
 
         service_name = ws["service_name"]
         full_service_name = f"projects/{self.project_id}/locations/{self.region}/services/{service_name}"
-        service = self.client.get_service(name=full_service_name)
+        try:
+            service = self.client.get_service(name=full_service_name)
+        except Exception as e:
+            raise RuntimeError(f"Failed to get service {service_name}: {e}")
 
-        tmpl = service.template
-        containers = list(getattr(tmpl, "containers", []) or [])
-        # Use a proper shell image for jobs instead of the hello image
-        image = "gcr.io/cloudrun/hello"  # We'll override this for jobs
-        # For jobs, use a proper shell image
-        job_image = "alpine:latest"  # Alpine has a proper shell
+        tmpl = getattr(service, "template", None)
         service_account = getattr(tmpl, "service_account", None) or f"agent-gcs-accessor@{self.project_id}.iam.gserviceaccount.com"
 
+        # Ensure a job exists to run arbitrary shell
         job_name = f"{service_name}-exec"
-        self._ensure_exec_job(job_name, image=job_image, service_account=service_account, env={
+        self._ensure_exec_job(job_name, image="alpine:latest", service_account=service_account, env={
             "WORKSPACE_ID": service_name,
             "NAMESPACE": ws["namespace"],
             "USER": ws["user"],
         })
 
-        # For Cloud Run Jobs, --args expects the format --args=[ARG,...]
+        # Pass arguments safely: repeat --args for each token to avoid CSV pitfalls
         exec_cmd = [
             "gcloud", "run", "jobs", "execute", job_name,
             "--region", self.region,
-            f"--args=-c,{command}",
-            "--task-timeout", "300s",  # Increase timeout for job execution (5 minutes)
+            "--args", "-c",
+            "--args", command,
+            "--task-timeout", "300s",
         ]
         logger.info("💻 Exec job: %s", " ".join(exec_cmd))
         try:
             proc = subprocess.run(exec_cmd, text=True, capture_output=True, timeout=30, check=False)
         except subprocess.TimeoutExpired:
-            raise RuntimeError(f"Job submission timed out after 30 seconds")
-        
+            raise RuntimeError("Job submission timed out after 30 seconds")
+
         # Extract execution ID from output
-        execution_id = None
-        for line in (proc.stdout + "\n" + proc.stderr).splitlines():
-            if "Execution [" in line and "] has successfully started running" in line:
-                # Extract execution ID from line like "Execution [execution-id] has successfully started running"
-                cleaned_line = re.sub(r'\x1b\[[0-9;]*m', '', line)
-                start = cleaned_line.find("[") + 1
-                end = cleaned_line.find("]")
-                if start > 0 and end > start:
-                    execution_id = cleaned_line[start:end]
-                break
-        
+        execution_id = self._extract_execution_id(proc.stdout + "\n" + proc.stderr)
         if not execution_id:
             raise RuntimeError("Could not extract execution ID from job submission")
-        
-        # Return job submission response - client can poll for completion
+
         logger.info("✅ Job submitted successfully: %s", execution_id)
-        
         return {
             "stdout": f"Job {execution_id} submitted successfully",
             "stderr": "",
@@ -285,7 +281,7 @@ class CloudRunService:
             "success": True,
             "execution_id": execution_id,
             "status": "submitted",
-            "message": "Job submitted successfully. Use execution_id to poll for status."
+            "message": "Job submitted successfully. Use execution_id to poll for status.",
         }
 
     def get_job_status(self, execution_id: str) -> Dict[str, Any]:
@@ -297,7 +293,7 @@ class CloudRunService:
                 "--format", "value(status.conditions[0].type,status.conditions[0].status,status.conditions[0].message)"
             ]
             status_proc = subprocess.run(status_cmd, text=True, capture_output=True, timeout=10, check=False)
-            
+
             if status_proc.returncode != 0:
                 return {
                     "success": False,
@@ -305,17 +301,16 @@ class CloudRunService:
                     "message": f"Failed to get status: {status_proc.stderr}",
                     "stdout": "",
                     "stderr": status_proc.stderr,
-                    "returncode": status_proc.returncode
+                    "returncode": status_proc.returncode,
                 }
-            
+
             status_output = status_proc.stdout.strip()
             parts = status_output.split('\t')
-            
+
             if len(parts) >= 3:
                 condition_type, condition_status, message = parts[0], parts[1], parts[2]
-                
                 if condition_type == "Ready" and condition_status == "True":
-                    # Job completed successfully, fetch logs
+                    # Try to fetch logs (alpha command may not be installed; best-effort)
                     try:
                         log_cmd = [
                             "gcloud", "alpha", "run", "jobs", "executions", "logs", "read",
@@ -323,27 +318,19 @@ class CloudRunService:
                         ]
                         log_proc = subprocess.run(log_cmd, text=True, capture_output=True, timeout=30)
                         stdout = log_proc.stdout.strip() if log_proc.returncode == 0 else ""
-                        
-                        return {
-                            "success": True,
-                            "status": "completed",
-                            "message": "Job completed successfully",
-                            "stdout": stdout,
-                            "stderr": "",
-                            "returncode": 0,
-                            "execution_id": execution_id
-                        }
                     except Exception as e:
-                        return {
-                            "success": True,
-                            "status": "completed",
-                            "message": f"Job completed but failed to fetch logs: {e}",
-                            "stdout": "",
-                            "stderr": str(e),
-                            "returncode": 0,
-                            "execution_id": execution_id
-                        }
-                
+                        stdout = ""
+                        logger.debug(f"Logs fetch failed for {execution_id}: {e}")
+
+                    return {
+                        "success": True,
+                        "status": "completed",
+                        "message": "Job completed successfully",
+                        "stdout": stdout,
+                        "stderr": "",
+                        "returncode": 0,
+                        "execution_id": execution_id,
+                    }
                 elif condition_type == "Failed":
                     return {
                         "success": False,
@@ -352,11 +339,9 @@ class CloudRunService:
                         "stdout": "",
                         "stderr": message or "Job failed",
                         "returncode": 1,
-                        "execution_id": execution_id
+                        "execution_id": execution_id,
                     }
-                
                 else:
-                    # Still running or pending
                     return {
                         "success": True,
                         "status": "running",
@@ -364,9 +349,9 @@ class CloudRunService:
                         "stdout": "",
                         "stderr": "",
                         "returncode": None,
-                        "execution_id": execution_id
+                        "execution_id": execution_id,
                     }
-            
+
             return {
                 "success": False,
                 "status": "unknown",
@@ -374,9 +359,9 @@ class CloudRunService:
                 "stdout": "",
                 "stderr": status_output,
                 "returncode": None,
-                "execution_id": execution_id
+                "execution_id": execution_id,
             }
-            
+
         except Exception as e:
             return {
                 "success": False,
@@ -385,7 +370,7 @@ class CloudRunService:
                 "stdout": "",
                 "stderr": str(e),
                 "returncode": None,
-                "execution_id": execution_id
+                "execution_id": execution_id,
             }
 
     # ---------- internals ----------
@@ -411,7 +396,10 @@ class CloudRunService:
             "--labels", labels,
             "--service-account", f"agent-gcs-accessor@{self.project_id}.iam.gserviceaccount.com",
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if res.returncode != 0:
+            logger.error("❌ Cloud Run deploy failed.\nSTDOUT:\n%s\nSTDERR:\n%s", res.stdout, res.stderr)
+            raise RuntimeError("Cloud Run deploy failed")
         url = self._extract_service_url(res.stdout) or self._extract_service_url(res.stderr)
         if not url:
             logger.error("Could not extract service URL.\nSTDOUT:\n%s\nSTDERR:\n%s", res.stdout, res.stderr)
@@ -435,7 +423,8 @@ class CloudRunService:
             "--max-retries", "0",
             "--task-timeout", "3600s",
             "--command", "/bin/sh",
-            "--args", "-c,echo exec-ready",
+            "--args", "-c",
+            "--args", "echo exec-ready",
             "--set-env-vars", env_kv,
             "--service-account", service_account,
         ]
@@ -447,10 +436,24 @@ class CloudRunService:
     @staticmethod
     def _extract_service_url(text: str) -> Optional[str]:
         for line in (text or "").splitlines():
-            if "Service URL:" in line:
-                cleaned = re.sub(r"\x1b\[[0-9;]*m", "", line)
+            # Common gcloud patterns:
+            # "Service URL: https://service-xyz-uc.a.run.app"
+            # or "URL: https://service-xyz-uc.a.run.app"
+            cleaned = re.sub(r"\x1b\[[0-9;]*m", "", line)
+            if "Service URL:" in cleaned:
                 return cleaned.split("Service URL:")[1].strip()
+            if re.search(r"https://[^\s]+\.run\.app", cleaned):
+                m = re.search(r"(https://[^\s]+\.run\.app)", cleaned)
+                if m:
+                    return m.group(1)
         return None
+
+    @staticmethod
+    def _extract_execution_id(text: str) -> Optional[str]:
+        # Example: "Execution [job-name-execution-abc] has successfully started running"
+        cleaned = re.sub(r"\x1b\[[0-9;]*m", "", text or "")
+        m = re.search(r"Execution \[([^\]]+)\]", cleaned)
+        return m.group(1) if m else None
 
     @staticmethod
     def _single_quote(s: str) -> str:
@@ -459,10 +462,15 @@ class CloudRunService:
     @staticmethod
     def _parse_job_result(text: str) -> Tuple[str, int]:
         status = "unknown"; rc = 0
-        if "FAILED" in text.upper(): status, rc = "Failed", 1
-        if ("SUCCEEDED" in text.upper()) or ("COMPLETED" in text.upper()): status = "Succeeded"
-        m = re.search(r"exit code[:=]\s*(\d+)", text, re.IGNORECASE)
-        if m: rc = int(m.group(1)); status = "Succeeded" if rc == 0 else "Failed"
+        up = (text or "").upper()
+        if "FAILED" in up:
+            status, rc = "Failed", 1
+        if ("SUCCEEDED" in up) or ("COMPLETED" in up):
+            status = "Succeeded"
+        m = re.search(r"exit code[:=]\s*(\d+)", text or "", re.IGNORECASE)
+        if m:
+            rc = int(m.group(1))
+            status = "Succeeded" if rc == 0 else "Failed"
         return status, rc
 
     def _find_bucket_by_label(self, key: str, value: str) -> Optional[str]:
@@ -475,6 +483,34 @@ class CloudRunService:
             if labels.get(key) == value:
                 return b.name
         return None
+
+    def _delete_bucket_force(self, bucket_name: str) -> None:
+        """Delete a bucket even if non-empty (works across client versions)."""
+        b = self.storage_client.bucket(bucket_name)
+        try:
+            # Try fast path if supported
+            b.delete(force=True)  # type: ignore[call-arg]
+            return
+        except TypeError:
+            pass
+        except Exception:
+            # fall back to manual
+            pass
+        # Manual delete all blobs (incl. versions), then bucket
+        try:
+            for blob in b.list_blobs():
+                try:
+                    blob.delete()
+                except Exception:
+                    continue
+            for blob in b.list_blobs(versions=True):
+                try:
+                    blob.delete()
+                except Exception:
+                    continue
+            b.delete()
+        except Exception as e:
+            raise RuntimeError(f"Failed to force-delete bucket {bucket_name}: {e}")
 
 
 cloudrun_service = CloudRunService()

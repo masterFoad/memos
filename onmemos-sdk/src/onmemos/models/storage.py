@@ -2,274 +2,193 @@
 Storage models for OnMemOS SDK
 """
 
-from typing import Optional, Dict, Any, List
-from pydantic import BaseModel, Field, validator
-from datetime import datetime
+from typing import Optional, List, Dict, Any, Union
+from pydantic import BaseModel, Field, validator, model_validator
+from enum import Enum
 
-from .base import OnMemOSModel, MountType
+from .base import OnMemOSModel
 
 
-class MountRequest(OnMemOSModel):
-    """Request model for mounting storage"""
-    mount_type: MountType = Field(..., description="Type of storage to mount")
-    source_name: str = Field(..., description="Storage source name (bucket/filestore)")
-    mount_path: str = Field(..., description="Mount path in container")
-    read_only: bool = Field(False, description="Mount as read-only")
-    options: Dict[str, Any] = Field(default_factory=dict, description="Mount options")
+class StorageType(str, Enum):
+    """Storage types supported by OnMemOS (matching server)"""
+    EPHEMERAL = "ephemeral"
+    PERSISTENT_VOLUME = "persistent_volume"
+    GCS_FUSE = "gcs_fuse"
+
+
+class StorageClass(str, Enum):
+    """Kubernetes storage classes"""
+    STANDARD = "standard"
+    STANDARD_RWO = "standard-rwo"
+    FAST_SSD = "fast-ssd"
+    PREMIUM_SSD = "premium-ssd"
+
+
+class AdditionalStorage(OnMemOSModel):
+    """Configuration for additional storage mounts"""
+    storage_type: StorageType = Field(..., description="Type of storage")
+    mount_path: str = Field(..., description="Path where storage will be mounted")
     
-    @validator('mount_path')
-    def validate_mount_path(cls, v):
-        """Validate mount path"""
-        if not v.startswith('/'):
-            raise ValueError("Mount path must be absolute (start with /)")
-        if v in ['/', '/root', '/home', '/etc', '/var', '/usr']:
-            raise ValueError(f"Cannot mount to system directory: {v}")
-        return v
-
-
-class Mount(OnMemOSModel):
-    """Storage mount model"""
-    mount_id: str = Field(..., description="Unique mount identifier")
-    session_id: str = Field(..., description="Associated session ID")
-    mount_type: MountType = Field(..., description="Storage type")
-    source_name: str = Field(..., description="Storage source name")
-    mount_path: str = Field(..., description="Mount path in container")
-    read_only: bool = Field(..., description="Read-only flag")
-    status: str = Field(..., description="Mount status")
-    created_at: datetime = Field(..., description="Mount timestamp")
-    options: Dict[str, Any] = Field(default_factory=dict, description="Mount options")
-    
-    # Mount-specific fields
+    # GCS FUSE specific fields
     bucket_name: Optional[str] = Field(None, description="GCS bucket name")
-    filestore_name: Optional[str] = Field(None, description="Filestore name")
-    persistent_volume_name: Optional[str] = Field(None, description="Persistent volume name")
+    gcs_mount_options: Optional[str] = Field(None, description="GCS FUSE mount options")
     
-    @property
-    def is_active(self) -> bool:
-        """Check if mount is active"""
-        return self.status in ["mounted", "active", "ready"]
+
     
-    @property
-    def is_gcs_bucket(self) -> bool:
-        """Check if this is a GCS bucket mount"""
-        return self.mount_type == MountType.GCS_BUCKET
+    # Generic fields
+    read_only: bool = Field(False, description="Mount as read-only")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
     
-    @property
-    def is_filestore(self) -> bool:
-        """Check if this is a filestore mount"""
-        return self.mount_type == MountType.FILESTORE
-    
-    @property
-    def is_persistent_volume(self) -> bool:
-        """Check if this is a persistent volume mount"""
-        return self.mount_type == MountType.PERSISTENT_VOLUME
+    @model_validator(mode='after')
+    def validate_storage_type_fields(self):
+        """Validate that required fields are present for each storage type"""
+        if self.storage_type == StorageType.GCS_FUSE:
+            if not self.bucket_name:
+                raise ValueError("bucket_name is required for GCS_FUSE storage")
+        elif self.storage_type == StorageType.FILESTORE:
+            if not self.filestore_instance:
+                raise ValueError("filestore_instance is required for FILESTORE storage")
+        return self
 
 
-class MountList(OnMemOSModel):
-    """List of mounts"""
-    mounts: List[Mount] = Field(..., description="List of mounts")
-    total: int = Field(..., description="Total number of mounts")
+class StorageConfig(OnMemOSModel):
+    """Complete storage configuration for a session"""
+    storage_type: StorageType = Field(..., description="Primary storage type")
+    mount_path: str = Field(..., description="Primary mount path")
     
-    @property
-    def active_mounts(self) -> List[Mount]:
-        """Get only active mounts"""
-        return [m for m in self.mounts if m.is_active]
+    # Persistent volume specific fields
+    pvc_name: Optional[str] = Field(None, description="Persistent Volume Claim name")
+    pvc_size: Optional[str] = Field(None, description="PVC size (e.g., '10Gi')")
+    storage_class: Optional[StorageClass] = Field(None, description="Storage class")
     
-    @property
-    def gcs_mounts(self) -> List[Mount]:
-        """Get only GCS bucket mounts"""
-        return [m for m in self.mounts if m.is_gcs_bucket]
+    # GCS FUSE specific fields (for primary storage)
+    bucket_name: Optional[str] = Field(None, description="GCS bucket name")
+    gcs_mount_options: Optional[str] = Field(None, description="GCS FUSE mount options")
     
-    @property
-    def filestore_mounts(self) -> List[Mount]:
-        """Get only filestore mounts"""
-        return [m for m in self.mounts if m.is_filestore]
+    # Filestore specific fields (for primary storage)
+    filestore_instance: Optional[str] = Field(None, description="Filestore instance name")
+    filestore_share: Optional[str] = Field(None, description="Filestore share name")
+    
+    # Additional storage mounts
+    additional_storage: List[AdditionalStorage] = Field(
+        default_factory=list, 
+        description="Additional storage mounts"
+    )
+    
+    # Generic fields
+    read_only: bool = Field(False, description="Mount as read-only")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
+    
+    @model_validator(mode='after')
+    def validate_storage_config(self):
+        """Validate storage configuration after all fields are set"""
+        if self.storage_type == StorageType.PERSISTENT_VOLUME:
+            if not self.pvc_name:
+                raise ValueError("pvc_name is required for PERSISTENT_VOLUME storage")
+            if not self.pvc_size:
+                raise ValueError("pvc_size is required for PERSISTENT_VOLUME storage")
+        elif self.storage_type == StorageType.GCS_FUSE:
+            if not self.bucket_name:
+                raise ValueError("bucket_name is required for GCS_FUSE storage")
+        elif self.storage_type == StorageType.FILESTORE:
+            if not self.filestore_instance:
+                raise ValueError("filestore_instance is required for FILESTORE storage")
+        return self
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary format expected by server"""
+        result = {
+            "storage_type": self.storage_type.value if hasattr(self.storage_type, 'value') else str(self.storage_type),
+            "mount_path": self.mount_path,
+            "read_only": self.read_only
+        }
+        
+        # Add type-specific fields
+        if self.storage_type == StorageType.PERSISTENT_VOLUME:
+            result.update({
+                "pvc_name": self.pvc_name,
+                "pvc_size": self.pvc_size,
+                "storage_class": self.storage_class.value if self.storage_class and hasattr(self.storage_class, 'value') else str(self.storage_class) if self.storage_class else None
+            })
+        elif self.storage_type == StorageType.GCS_FUSE:
+            result.update({
+                "bucket_name": self.bucket_name,
+                "gcs_mount_options": self.gcs_mount_options
+            })
+        elif self.storage_type == StorageType.FILESTORE:
+            result.update({
+                "filestore_instance": self.filestore_instance,
+                "filestore_share": self.filestore_share
+            })
+        
+        # Add additional storage
+        if self.additional_storage:
+            result["additional_storage"] = [
+                storage.dict(exclude_none=True) for storage in self.additional_storage
+            ]
+        
+        # Add metadata
+        if self.metadata:
+            result["metadata"] = self.metadata
+        
+        return result
 
 
-class FileInfo(OnMemOSModel):
-    """File information model"""
-    name: str = Field(..., description="File name")
-    path: str = Field(..., description="File path")
-    size: int = Field(..., description="File size in bytes")
-    is_directory: bool = Field(..., description="Is directory flag")
-    modified_at: datetime = Field(..., description="Last modification time")
-    permissions: str = Field(..., description="File permissions")
-    owner: str = Field(..., description="File owner")
-    mount_path: Optional[str] = Field(None, description="Associated mount path")
+# Convenience functions for common storage configurations
+def create_persistent_storage_config(
+    mount_path: str = "/workspace",
+    pvc_name: Optional[str] = None,
+    pvc_size: str = "10Gi",
+    storage_class: StorageClass = StorageClass.STANDARD_RWO,
+    additional_storage: Optional[List[AdditionalStorage]] = None
+) -> StorageConfig:
+    """Create a persistent volume storage configuration"""
+    if pvc_name is None:
+        import time
+        pvc_name = f"pvc-{int(time.time())}"
     
-    @property
-    def size_mb(self) -> float:
-        """File size in MB"""
-        return self.size / (1024 * 1024)
-    
-    @property
-    def size_gb(self) -> float:
-        """File size in GB"""
-        return self.size / (1024 * 1024 * 1024)
-    
-    @property
-    def is_file(self) -> bool:
-        """Check if this is a file"""
-        return not self.is_directory
-    
-    @property
-    def extension(self) -> Optional[str]:
-        """Get file extension"""
-        if self.is_directory:
-            return None
-        parts = self.name.split('.')
-        return parts[-1] if len(parts) > 1 else None
+    return StorageConfig(
+        storage_type=StorageType.PERSISTENT_VOLUME,
+        mount_path=mount_path,
+        pvc_name=pvc_name,
+        pvc_size=pvc_size,
+        storage_class=storage_class,
+        additional_storage=additional_storage or []
+    )
 
 
-class FileList(OnMemOSModel):
-    """List of files with directory information"""
-    files: List[FileInfo] = Field(..., description="List of files")
-    directory: str = Field(..., description="Current directory path")
-    total_files: int = Field(..., description="Total number of files")
-    total_directories: int = Field(..., description="Total number of directories")
-    total_size: int = Field(..., description="Total size in bytes")
-    
-    @property
-    def directories(self) -> List[FileInfo]:
-        """Get only directories"""
-        return [f for f in self.files if f.is_directory]
-    
-    @property
-    def regular_files(self) -> List[FileInfo]:
-        """Get only regular files"""
-        return [f for f in self.files if f.is_file]
-    
-    @property
-    def total_size_mb(self) -> float:
-        """Total size in MB"""
-        return self.total_size / (1024 * 1024)
-    
-    @property
-    def total_size_gb(self) -> float:
-        """Total size in GB"""
-        return self.total_size / (1024 * 1024 * 1024)
+def create_gcs_storage_config(
+    bucket_name: str,
+    mount_path: str = "/data",
+    gcs_mount_options: str = "implicit-dirs,file-mode=0644,dir-mode=0755",
+    additional_storage: Optional[List[AdditionalStorage]] = None
+) -> StorageConfig:
+    """Create a GCS FUSE storage configuration"""
+    return StorageConfig(
+        storage_type=StorageType.GCS_FUSE,
+        mount_path=mount_path,
+        bucket_name=bucket_name,
+        gcs_mount_options=gcs_mount_options,
+        additional_storage=additional_storage or []
+    )
 
 
-class UploadRequest(OnMemOSModel):
-    """File upload request"""
-    local_path: str = Field(..., description="Local file path")
-    remote_path: str = Field(..., description="Remote file path")
-    overwrite: bool = Field(False, description="Overwrite existing file")
-    chunk_size: int = Field(8192, ge=1024, le=1048576, description="Upload chunk size")
-    
-    @validator('local_path')
-    def validate_local_path(cls, v):
-        """Validate local file path"""
-        from pathlib import Path
-        path = Path(v)
-        if not path.exists():
-            raise ValueError(f"Local file does not exist: {v}")
-        if not path.is_file():
-            raise ValueError(f"Local path is not a file: {v}")
-        return str(path.absolute())
-    
-    @validator('remote_path')
-    def validate_remote_path(cls, v):
-        """Validate remote file path"""
-        if not v.startswith('/'):
-            raise ValueError("Remote path must be absolute (start with /)")
-        return v
-
-
-class DownloadRequest(OnMemOSModel):
-    """File download request"""
-    remote_path: str = Field(..., description="Remote file path")
-    local_path: str = Field(..., description="Local file path")
-    chunk_size: int = Field(8192, ge=1024, le=1048576, description="Download chunk size")
-    
-    @validator('remote_path')
-    def validate_remote_path(cls, v):
-        """Validate remote file path"""
-        if not v.startswith('/'):
-            raise ValueError("Remote path must be absolute (start with /)")
-        return v
-    
-    @validator('local_path')
-    def validate_local_path(cls, v):
-        """Validate local file path"""
-        from pathlib import Path
-        path = Path(v)
-        parent = path.parent
-        if not parent.exists():
-            parent.mkdir(parents=True, exist_ok=True)
-        return str(path.absolute())
-
-
-class StorageUsage(OnMemOSModel):
-    """Storage usage information"""
-    session_id: str = Field(..., description="Session identifier")
-    total_size_gb: float = Field(..., description="Total storage size in GB")
-    used_size_gb: float = Field(..., description="Used storage size in GB")
-    available_size_gb: float = Field(..., description="Available storage size in GB")
-    mount_count: int = Field(..., description="Number of active mounts")
-    file_count: int = Field(..., description="Total number of files")
-    directory_count: int = Field(..., description="Total number of directories")
-    timestamp: datetime = Field(..., description="Usage timestamp")
-    
-    @property
-    def usage_percent(self) -> float:
-        """Calculate storage usage percentage"""
-        if self.total_size_gb == 0:
-            return 0.0
-        return (self.used_size_gb / self.total_size_gb) * 100
-    
-    @property
-    def is_near_limit(self) -> bool:
-        """Check if storage usage is near limit (80%+)"""
-        return self.usage_percent >= 80.0
-    
-    @property
-    def is_full(self) -> bool:
-        """Check if storage is full (95%+)"""
-        return self.usage_percent >= 95.0
-
-
-class BucketInfo(OnMemOSModel):
-    """GCS bucket information"""
-    bucket_name: str = Field(..., description="Bucket name")
-    location: str = Field(..., description="Bucket location")
-    storage_class: str = Field(..., description="Storage class")
-    created_at: datetime = Field(..., description="Creation timestamp")
-    size_gb: float = Field(..., description="Bucket size in GB")
-    object_count: int = Field(..., description="Number of objects")
-    is_public: bool = Field(..., description="Is public bucket")
-    labels: Dict[str, str] = Field(default_factory=dict, description="Bucket labels")
-    
-    @property
-    def size_mb(self) -> float:
-        """Bucket size in MB"""
-        return self.size_gb * 1024
-    
-    @property
-    def size_bytes(self) -> int:
-        """Bucket size in bytes"""
-        return int(self.size_gb * 1024 * 1024 * 1024)
-
-
-class FilestoreInfo(OnMemOSModel):
-    """Filestore information"""
-    filestore_name: str = Field(..., description="Filestore name")
-    location: str = Field(..., description="Filestore location")
-    tier: str = Field(..., description="Performance tier")
-    capacity_gb: int = Field(..., description="Capacity in GB")
-    used_gb: int = Field(..., description="Used space in GB")
-    created_at: datetime = Field(..., description="Creation timestamp")
-    network: str = Field(..., description="Network name")
-    labels: Dict[str, str] = Field(default_factory=dict, description="Filestore labels")
-    
-    @property
-    def available_gb(self) -> int:
-        """Available space in GB"""
-        return self.capacity_gb - self.used_gb
-    
-    @property
-    def usage_percent(self) -> float:
-        """Usage percentage"""
-        if self.capacity_gb == 0:
-            return 0.0
-        return (self.used_gb / self.capacity_gb) * 100
+def create_multi_storage_config(
+    primary_storage: StorageConfig,
+    additional_storage: List[AdditionalStorage]
+) -> StorageConfig:
+    """Create a multi-storage configuration"""
+    return StorageConfig(
+        storage_type=primary_storage.storage_type,
+        mount_path=primary_storage.mount_path,
+        pvc_name=primary_storage.pvc_name,
+        pvc_size=primary_storage.pvc_size,
+        storage_class=primary_storage.storage_class,
+        bucket_name=primary_storage.bucket_name,
+        gcs_mount_options=primary_storage.gcs_mount_options,
+        filestore_instance=primary_storage.filestore_instance,
+        filestore_share=primary_storage.filestore_share,
+        additional_storage=additional_storage,
+        read_only=primary_storage.read_only,
+        metadata=primary_storage.metadata
+    )

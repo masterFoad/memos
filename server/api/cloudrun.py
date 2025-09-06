@@ -7,14 +7,14 @@ API endpoints for Cloud Run-based workspace management
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Depends, Query
-from typing import Optional
 import logging
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from server.core.security import require_api_key
 from server.services.cloudrun.cloudrun_service import cloudrun_service
-from server.models.sessions import CreateSessionRequest, SessionInfo
-from fastapi import HTTPException
+from server.models.sessions import CreateSessionRequest
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/cloudrun", tags=["cloudrun"])
@@ -23,11 +23,14 @@ router = APIRouter(prefix="/v1/cloudrun", tags=["cloudrun"])
 @router.post("/workspaces")
 async def create_cloudrun_workspace(
     workspace: CreateSessionRequest,
-    api_key: str = Depends(require_api_key),
+    _api_key: str = Depends(require_api_key),  # verify API key; value unused
 ):
+    """
+    Create a Cloud Run workspace.
+    """
     try:
         result = cloudrun_service.create_workspace(
-            template="python",  # Default template for Cloud Run
+            template="python",  # default template for Cloud Run
             namespace=workspace.namespace,
             user=workspace.user,
             ttl_minutes=workspace.ttl_minutes or 180,
@@ -46,16 +49,19 @@ async def create_cloudrun_workspace(
             "ttl_minutes": result.get("ttl_minutes"),
         }
     except Exception as e:
-        logger.exception("create_workspace failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("create_cloudrun_workspace failed")
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.get("/workspaces")
 async def list_cloudrun_workspaces(
     namespace: Optional[str] = Query(None),
     user: Optional[str] = Query(None),
-    api_key: str = Depends(require_api_key),
+    _api_key: str = Depends(require_api_key),
 ):
+    """
+    List Cloud Run workspaces (optionally filter by namespace/user).
+    """
     try:
         items = cloudrun_service.list_workspaces(namespace=namespace, user=user)
         return {
@@ -77,14 +83,17 @@ async def list_cloudrun_workspaces(
         }
     except Exception as e:
         logger.exception("list_cloudrun_workspaces failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.get("/workspaces/{workspace_id}")
 async def get_cloudrun_workspace(
     workspace_id: str,
-    api_key: str = Depends(require_api_key),
+    _api_key: str = Depends(require_api_key),
 ):
+    """
+    Get a single Cloud Run workspace by ID.
+    """
     ws = cloudrun_service.get_workspace(workspace_id)
     if not ws:
         raise HTTPException(status_code=404, detail="Workspace not found")
@@ -105,8 +114,11 @@ async def get_cloudrun_workspace(
 @router.delete("/workspaces/{workspace_id}")
 async def delete_cloudrun_workspace(
     workspace_id: str,
-    api_key: str = Depends(require_api_key),
+    _api_key: str = Depends(require_api_key),
 ):
+    """
+    Delete a Cloud Run workspace by ID.
+    """
     ok = cloudrun_service.delete_workspace(workspace_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Workspace not found")
@@ -118,31 +130,48 @@ async def execute_in_cloudrun_workspace(
     workspace_id: str,
     command: str = Query(..., description="Shell command to execute"),
     timeout: int = Query(120, description="Timeout seconds"),
-    api_key: str = Depends(require_api_key),
+    _api_key: str = Depends(require_api_key),
 ):
+    """
+    Execute a shell command in the Cloud Run workspace.
+    Returns job submission info; poll with your jobs status endpoint/util.
+    """
     try:
         res = cloudrun_service.execute_in_workspace(workspace_id, command, timeout)
         return {"workspace_id": workspace_id, **res, "command": command}
     except Exception as e:
-        logger.exception("cloudrun execute failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("execute_in_cloudrun_workspace failed")
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.post("/workspaces/{workspace_id}/runsh")
 async def run_shell_in_cloudrun_workspace(
     workspace_id: str,
     command: str = Query(..., description="Shell command to execute"),
-    api_key: str = Depends(require_api_key),
+    _api_key: str = Depends(require_api_key),
 ):
-    return await execute_in_cloudrun_workspace(workspace_id, command, 120, api_key)
+    """
+    Convenience wrapper over /execute for shell commands.
+    """
+    return await execute_in_cloudrun_workspace(
+        workspace_id=workspace_id,
+        command=command,
+        timeout=120,
+    )
 
 
 @router.post("/workspaces/{workspace_id}/runpython")
 async def run_python_in_cloudrun_workspace(
     workspace_id: str,
     code: str = Query(..., description="Python code to execute"),
-    api_key: str = Depends(require_api_key),
+    _api_key: str = Depends(require_api_key),
 ):
-    # use here-doc to avoid quoting issues
+    """
+    Run inline Python code inside the Cloud Run workspace using a here-doc.
+    """
     cmd = f"python3 - <<'PY'\n{code}\nPY"
-    return await execute_in_cloudrun_workspace(workspace_id, cmd, 180, api_key)
+    return await execute_in_cloudrun_workspace(
+        workspace_id=workspace_id,
+        command=cmd,
+        timeout=180,
+    )
