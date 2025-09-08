@@ -645,6 +645,10 @@ app.include_router(templates_router)
 app.include_router(cost_estimation_router)
 app.include_router(admin_router)
 
+# Import and include storage API
+from .api.storage import router as storage_router
+app.include_router(storage_router)
+
 
 # Shutdown event - Stop session monitor
 @app.on_event("shutdown")

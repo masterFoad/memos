@@ -6,6 +6,8 @@ from .config import Config
 from .http import HttpClient
 from .shuttles import Shuttles
 from .missions import Missions
+from .vaults import Vaults
+from .drives import Drives
 
 
 class Starbase:
@@ -26,5 +28,7 @@ class Starbase:
         # Public service groups
         self.shuttles = Shuttles(self._http)
         self.missions = Missions(self._http)
+        self.vaults = Vaults(self._http)
+        self.drives = Drives(self._http)
 
 

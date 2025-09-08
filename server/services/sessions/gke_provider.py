@@ -115,39 +115,90 @@ class GkeSessionProvider:
         # Build storage config from allocation if not provided
         storage_config = req.storage_config
         if storage_config is None:
-            has_bucket = bool(storage_allocation.bucket_name)
-            has_pvc = bool(storage_allocation.persistent_volume_name)
+            # Check for reusable storage resources first
+            use_vault = getattr(req, 'use_vault', None)
+            use_drive = getattr(req, 'use_drive', None)
+            vault_mount_path = getattr(req, 'vault_mount_path', '/workspace')
+            drive_mount_path = getattr(req, 'drive_mount_path', '/data')
+            
+            if use_vault or use_drive:
+                # Use reusable storage resources
+                additional_storage = []
+                
+                if use_vault:
+                    # Get bucket resource details
+                    bucket_resource = await self.db._execute_single(
+                        "SELECT * FROM storage_resources WHERE resource_id = ?",
+                        (use_vault,)
+                    )
+                    if bucket_resource:
+                        storage_config = StorageConfig(
+                            storage_type=StorageType.GCS_FUSE,
+                            bucket_name=bucket_resource['resource_name'],  # Use resource name as bucket name
+                            mount_path=vault_mount_path
+                        )
+                
+                if use_drive:
+                    # Get filestore resource details
+                    filestore_resource = await self.db._execute_single(
+                        "SELECT * FROM storage_resources WHERE resource_id = ?",
+                        (use_drive,)
+                    )
+                    if filestore_resource:
+                        if storage_config is None:
+                            # Primary storage is the filestore
+                            storage_config = StorageConfig(
+                                storage_type=StorageType.PERSISTENT_VOLUME,
+                                pvc_name=filestore_resource['resource_name'],  # Use resource name as PVC name
+                                pvc_size=f"{filestore_resource['size_gb']}Gi",
+                                mount_path=drive_mount_path
+                            )
+                        else:
+                            # Additional storage
+                            additional_storage.append(StorageConfig(
+                                storage_type=StorageType.PERSISTENT_VOLUME,
+                                pvc_name=filestore_resource['resource_name'],
+                                pvc_size=f"{filestore_resource['size_gb']}Gi",
+                                mount_path=drive_mount_path
+                            ))
+                
+                if additional_storage:
+                    storage_config.additional_storage = additional_storage
+            else:
+                # Use traditional allocation-based storage
+                has_bucket = bool(storage_allocation.bucket_name)
+                has_pvc = bool(storage_allocation.persistent_volume_name)
 
-            if has_bucket and has_pvc:
-                # Primary: bucket at /workspace, Additional: PVC at /data
-                storage_config = StorageConfig(
-                    storage_type=StorageType.GCS_FUSE,
-                    bucket_name=storage_allocation.bucket_name,
-                    mount_path=storage_request.mount_path
-                )
-                storage_config.additional_storage = [
-                    StorageConfig(
+                if has_bucket and has_pvc:
+                    # Primary: bucket at /workspace, Additional: PVC at /data
+                    storage_config = StorageConfig(
+                        storage_type=StorageType.GCS_FUSE,
+                        bucket_name=storage_allocation.bucket_name,
+                        mount_path=storage_request.mount_path
+                    )
+                    storage_config.additional_storage = [
+                        StorageConfig(
+                            storage_type=StorageType.PERSISTENT_VOLUME,
+                            pvc_name=storage_allocation.persistent_volume_name,
+                            pvc_size=f"{storage_request.persistent_storage_size_gb}Gi",
+                            mount_path="/data"
+                        )
+                    ]
+                elif has_bucket:
+                    storage_config = StorageConfig(
+                        storage_type=StorageType.GCS_FUSE,
+                        bucket_name=storage_allocation.bucket_name,
+                        mount_path=storage_request.mount_path
+                    )
+                elif has_pvc:
+                    storage_config = StorageConfig(
                         storage_type=StorageType.PERSISTENT_VOLUME,
                         pvc_name=storage_allocation.persistent_volume_name,
                         pvc_size=f"{storage_request.persistent_storage_size_gb}Gi",
-                        mount_path="/data"
+                        mount_path=storage_request.mount_path
                     )
-                ]
-            elif has_bucket:
-                storage_config = StorageConfig(
-                    storage_type=StorageType.GCS_FUSE,
-                    bucket_name=storage_allocation.bucket_name,
-                    mount_path=storage_request.mount_path
-                )
-            elif has_pvc:
-                storage_config = StorageConfig(
-                    storage_type=StorageType.PERSISTENT_VOLUME,
-                    pvc_name=storage_allocation.persistent_volume_name,
-                    pvc_size=f"{storage_request.persistent_storage_size_gb}Gi",
-                    mount_path=storage_request.mount_path
-                )
-            else:
-                storage_config = StorageConfig(storage_type=StorageType.EPHEMERAL)
+                else:
+                    storage_config = StorageConfig(storage_type=StorageType.EPHEMERAL)
 
         # Augment storage_config with workspace defaults (auto-mount) if available
         try:

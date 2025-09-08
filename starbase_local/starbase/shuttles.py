@@ -24,8 +24,12 @@ class Shuttles:
         template_id: str = "dev-python",
         use_vault: bool = False,
         vault_size_gb: Optional[int] = None,
+        vault_id: Optional[str] = None,
+        vault_name: Optional[str] = None,
         use_drive: bool = False,
         drive_size_gb: Optional[int] = None,
+        drive_id: Optional[str] = None,
+        drive_name: Optional[str] = None,
         ttl_minutes: int = 60,
         env: Optional[Dict[str, str]] = None,
     ) -> Shuttle:
@@ -36,12 +40,23 @@ class Shuttles:
             "template_id": template_id,
             "namespace": dock_id,
             "ttl_minutes": ttl_minutes,
-            "request_bucket": bool(use_vault),
-            "bucket_size_gb": vault_size_gb,
-            "request_persistent_storage": bool(use_drive),
-            "persistent_storage_size_gb": drive_size_gb,
             "env": env or {},
         }
+        
+        # Handle reusable storage resources
+        if vault_id or vault_name:
+            body["vault_id"] = vault_id
+            body["vault_name"] = vault_name
+        elif use_vault:
+            body["request_bucket"] = True
+            body["bucket_size_gb"] = vault_size_gb
+        
+        if drive_id or drive_name:
+            body["drive_id"] = drive_id
+            body["drive_name"] = drive_name
+        elif use_drive:
+            body["request_persistent_storage"] = True
+            body["persistent_storage_size_gb"] = drive_size_gb
         res = self._http.request("POST", "/v1/sessions", json=body)
         data = res.get("session") or res
         mounts = {

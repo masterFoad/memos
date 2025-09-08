@@ -45,25 +45,25 @@ def _req(method: str, url: str, headers: Dict[str, str], **kw) -> Dict[str, Any]
 
 
 def admin_create_user(host: str, ikey: str, email: str, name: Optional[str]) -> Dict[str, Any]:
-    url = f"{host}/v1/admin/users"
+    url = f"{host}/admin/v1/admin/users"
     body = {"email": email, "name": name, "user_type": "pro"}
     return _req("POST", url, _h_admin(ikey), data=json.dumps(body))
 
 
 def admin_create_passport(host: str, ikey: str, user_id: str) -> Dict[str, Any]:
-    url = f"{host}/v1/admin/passports"
+    url = f"{host}/admin/v1/admin/passports"
     body = {"user_id": user_id, "name": "default", "permissions": []}
     return _req("POST", url, _h_admin(ikey), data=json.dumps(body))
 
 
 def admin_add_credits(host: str, ikey: str, user_id: str, amount: float) -> Dict[str, Any]:
-    url = f"{host}/v1/admin/credits/add"
+    url = f"{host}/admin/v1/admin/credits/add"
     body = {"user_id": user_id, "amount": amount, "source": "sdk_e2e", "description": "bootstrap credits"}
     return _req("POST", url, _h_admin(ikey), data=json.dumps(body))
 
 
 def admin_create_workspace(host: str, ikey: str, user_id: str, name: str) -> Dict[str, Any]:
-    url = f"{host}/v1/admin/workspaces"
+    url = f"{host}/admin/v1/admin/workspaces"
     body = {"user_id": user_id, "name": name, "resource_package": "dev_small", "description": "sdk e2e"}
     return _req("POST", url, _h_admin(ikey), data=json.dumps(body))
 
@@ -85,7 +85,8 @@ def wait_until_running(sb: Starbase, sid: str, timeout_s: int = 300) -> Dict[str
 
 def main():
     p = argparse.ArgumentParser(description="Starbase SDK E2E")
-    p.add_argument("--host", default=os.getenv("ONMEM_HOST", "http://127.0.0.1:8080"))
+    p.add_argument("--host", default=os.getenv("ONMEM_HOST", "http://127.0.0.1:8080"), help="Public API host")
+    p.add_argument("--admin-host", default=os.getenv("ONMEM_ADMIN_HOST", "http://127.0.0.1:8001"), help="Admin API host")
     p.add_argument("--internal-key", default=os.getenv("ONMEM_INTERNAL_KEY", "onmemos-internal-key-2024-secure"))
     p.add_argument("--email", required=True)
     p.add_argument("--name", default=None)
@@ -95,52 +96,93 @@ def main():
     p.add_argument("--vault-size", type=int, default=10)
     p.add_argument("--use-drive", action="store_true")
     p.add_argument("--drive-size", type=int, default=10)
+    p.add_argument("--test-reusable", action="store_true", help="Test reusable storage resources")
     p.add_argument("--keep", action="store_true")
     p.add_argument("--interactive", action="store_true", help="Open interactive WS shell after launch")
     args = p.parse_args()
 
     host = args.host.rstrip("/")
+    admin_host = args.admin_host.rstrip("/")
     ikey = args.internal_key
 
     print("[1] Admin: create user")
-    u = admin_create_user(host, ikey, args.email, args.name).get("user")
+    u = admin_create_user(admin_host, ikey, args.email, args.name).get("user")
     user_id = u.get("user_id") or u.get("id")
     print("    user_id=", user_id)
 
     print("[2] Admin: create passport")
-    pp = admin_create_passport(host, ikey, user_id)
+    pp = admin_create_passport(admin_host, ikey, user_id)
     passport = pp.get("passport_key") or pp.get("passport") or pp.get("key")
     print("    passport=", (passport or "")[:8] + "...")
 
     if args.credits > 0:
         print(f"[3] Admin: add credits +{args.credits}")
-        admin_add_credits(host, ikey, user_id, args.credits)
+        admin_add_credits(admin_host, ikey, user_id, args.credits)
 
     print("[4] Admin: create dock (workspace)")
-    ws = admin_create_workspace(host, ikey, user_id, name="dev").get("workspace")
+    ws = admin_create_workspace(admin_host, ikey, user_id, name="dev").get("workspace")
     dock_id = ws.get("workspace_id") or ws.get("id")
     print("    dock_id=", dock_id)
 
-    print("[5] User: launch shuttle via Starbase")
+    # Test reusable storage if requested
+    vault_id = None
+    drive_id = None
+    if args.test_reusable:
+        print("[5] Testing reusable storage resources...")
+        sb = Starbase(base_url=host, api_key=passport, timeout=(5, 600), retries=2)
+        
+        # Create a reusable vault
+        print("    Creating reusable vault...")
+        vault = sb.vaults.create_vault(dock_id, "test-vault", size_gb=5)
+        vault_id = vault["resource_id"]
+        print(f"    vault_id={vault_id[:8]}...")
+        
+        # Create a reusable drive
+        print("    Creating reusable drive...")
+        drive = sb.drives.create_drive(dock_id, "test-drive", size_gb=5)
+        drive_id = drive["resource_id"]
+        print(f"    drive_id={drive_id[:8]}...")
+        
+        # List storage resources
+        storage = sb.vaults.list(dock_id)
+        print(f"    storage resources: {len(storage.get('resources', []))}")
+
+    print("[6] User: launch shuttle via Starbase")
     sb = Starbase(base_url=host, api_key=passport, timeout=(5, 600), retries=2)
-    shuttle = sb.shuttles.launch(
-        dock_id=dock_id,
-        provider=args.provider,
-        template_id="dev-python",
-        use_vault=args.use_vault,
-        vault_size_gb=args.vault_size,
-        use_drive=args.use_drive,
-        drive_size_gb=args.drive_size,
-        ttl_minutes=60,
-    )
+    
+    if args.test_reusable and vault_id and drive_id:
+        # Use reusable storage
+        shuttle = sb.shuttles.launch(
+            dock_id=dock_id,
+            provider=args.provider,
+            template_id="dev-python",
+            vault_id=vault_id,
+            drive_id=drive_id,
+            ttl_minutes=60,
+        )
+        print(f"    Using reusable storage: vault={vault_id[:8]}..., drive={drive_id[:8]}...")
+    else:
+        # Use traditional on-demand storage
+        shuttle = sb.shuttles.launch(
+            dock_id=dock_id,
+            provider=args.provider,
+            template_id="dev-python",
+            use_vault=args.use_vault,
+            vault_size_gb=args.vault_size,
+            use_drive=args.use_drive,
+            drive_size_gb=args.drive_size,
+            ttl_minutes=60,
+        )
+        print(f"    Using on-demand storage: vault={args.use_vault}, drive={args.use_drive}")
+    
     sid = shuttle.id
     print("    shuttle_id=", sid)
 
-    print("[6] Wait until running")
+    print("[7] Wait until running")
     info = wait_until_running(sb, sid)
     print("    status=", info.get("status"))
 
-    print("[7] Execute commands")
+    print("[8] Execute commands")
     for cmd in ["pwd", "ls -la", "echo 'hello from SDK'"]:
         try:
             res = sb.shuttles.execute(sid, cmd, timeout_s=60)
@@ -149,7 +191,7 @@ def main():
             print(f"[-] execute failed: {e}")
 
     if args.interactive:
-        print("[8] Interactive shell (WebSocket)...")
+        print("[9] Interactive shell (WebSocket)...")
         if create_connection is None:
             print("[-] websocket-client not installed. pip install websocket-client")
         else:
@@ -165,7 +207,8 @@ def main():
                 if not (ns and pod):
                     print("[-] Could not determine namespace/pod for WS. Skipping.")
                 else:
-                    ws_url = f"{host.replace('http', 'ws')}/v1/gke/shell/{sid}?k8s_ns={ns}&pod={pod}&token={token.token}"
+                    # Use passport for WebSocket authentication (more reliable than JWT token)
+                    ws_url = f"{host.replace('http', 'ws')}/v1/gke/shell/{sid}?k8s_ns={ns}&pod={pod}&passport={passport}"
                     print(f"    connecting: {ws_url}")
                     ws = create_connection(ws_url)
                     print("[+] Connected. Type commands, or '/exit' to quit.")
@@ -201,11 +244,26 @@ def main():
             except Exception as e:
                 print(f"[-] WS shell error: {e}")
 
+    # Clean up reusable storage if created
+    if args.test_reusable and vault_id and drive_id:
+        print("[10] Cleaning up reusable storage...")
+        try:
+            sb.vaults.delete(vault_id)
+            print(f"    ✅ Vault {vault_id[:8]}... deleted")
+        except Exception as e:
+            print(f"    ⚠️ Failed to delete vault: {e}")
+        
+        try:
+            sb.drives.delete(drive_id)
+            print(f"    ✅ Drive {drive_id[:8]}... deleted")
+        except Exception as e:
+            print(f"    ⚠️ Failed to delete drive: {e}")
+
     if args.keep:
-        print("[9] Keeping shuttle as requested (--keep). Done.")
+        print("[11] Keeping shuttle as requested (--keep). Done.")
         return
 
-    print("[9] Terminate shuttle")
+    print("[11] Terminate shuttle")
     try:
         sb.shuttles.terminate(sid)
         print("    terminated")

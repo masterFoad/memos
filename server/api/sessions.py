@@ -26,6 +26,45 @@ async def create_session(spec: Dict[str, Any] = Body(...), user: Dict = Depends(
         if not ws or ws.get("user_id") != user["user_id"]:
             raise HTTPException(403, "workspace does not belong to the authenticated user")
         spec.setdefault("namespace", ws_id)
+        
+        # Handle reusable storage resources
+        vault_id = spec.get("vault_id")
+        drive_id = spec.get("drive_id")
+        vault_name = spec.get("vault_name")
+        drive_name = spec.get("drive_name")
+        
+        if vault_id or vault_name or drive_id or drive_name:
+            # Use reusable storage instead of creating new ones
+            storage_resources = await db.list_workspace_storage(ws_id)
+            
+            if vault_id or vault_name:
+                # Find bucket by ID or name
+                bucket_resource = None
+                if vault_id:
+                    bucket_resource = next((r for r in storage_resources if r['resource_id'] == vault_id), None)
+                elif vault_name:
+                    bucket_resource = next((r for r in storage_resources if r['resource_name'] == vault_name and r['storage_type'] == 'gcs_bucket'), None)
+                
+                if not bucket_resource:
+                    raise HTTPException(400, f"Vault not found: {vault_id or vault_name}")
+                
+                spec["use_vault"] = bucket_resource['resource_id']
+                spec["vault_mount_path"] = bucket_resource.get('mount_path', '/workspace')
+            
+            if drive_id or drive_name:
+                # Find filestore by ID or name
+                filestore_resource = None
+                if drive_id:
+                    filestore_resource = next((r for r in storage_resources if r['resource_id'] == drive_id), None)
+                elif drive_name:
+                    filestore_resource = next((r for r in storage_resources if r['resource_name'] == drive_name and r['storage_type'] == 'filestore_pvc'), None)
+                
+                if not filestore_resource:
+                    raise HTTPException(400, f"Drive not found: {drive_id or drive_name}")
+                
+                spec["use_drive"] = filestore_resource['resource_id']
+                spec["drive_mount_path"] = filestore_resource.get('mount_path', '/data')
+        
         info = await sessions_manager.create_session(spec)
         return {"session": info}
     except HTTPException:

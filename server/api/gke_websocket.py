@@ -170,6 +170,18 @@ def _get_passport_from_ws_query(websocket: WebSocket) -> str:
         raise ValueError("passport required")
     return passport
 
+def _get_auth_from_ws_query(websocket: WebSocket) -> tuple[str, str]:
+    """Extract authentication from WebSocket query string (passport or token)."""
+    passport = websocket.query_params.get("passport")
+    token = websocket.query_params.get("token")
+    
+    if passport:
+        return "passport", passport
+    elif token:
+        return "token", token
+    else:
+        raise ValueError("passport or token required")
+
 
 @router.websocket("/shell/{session_id}")
 async def gke_websocket_shell(websocket: WebSocket, session_id: str):
@@ -182,12 +194,25 @@ async def gke_websocket_shell(websocket: WebSocket, session_id: str):
             await websocket.close(code=1008, reason="Missing k8s_ns or pod parameters")
             return
 
-        # Validate passport BEFORE accept (and ensure session ownership)
+        # Validate authentication BEFORE accept (and ensure session ownership)
         try:
-            passport = _get_passport_from_ws_query(websocket)
-            user_info = await verify_passport(x_api_key=passport)
+            auth_type, auth_value = _get_auth_from_ws_query(websocket)
+            if auth_type == "passport":
+                user_info = await verify_passport(x_api_key=auth_value)
+            elif auth_type == "token":
+                # Verify JWT token
+                import jwt
+                from server.core.config import load_settings
+                settings = load_settings()
+                try:
+                    payload = jwt.decode(auth_value, settings.server.jwt_secret, algorithms=["HS256"])
+                    user_info = {"user_id": payload.get("sub")}
+                except jwt.InvalidTokenError as e:
+                    raise ValueError(f"Invalid JWT token: {e}")
+            else:
+                raise ValueError(f"Unknown auth type: {auth_type}")
         except Exception as e:
-            await websocket.close(code=1008, reason=f"passport error: {e}")
+            await websocket.close(code=1008, reason=f"authentication error: {e}")
             return
 
         # Check session ownership
