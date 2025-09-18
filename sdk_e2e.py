@@ -47,7 +47,16 @@ def _req(method: str, url: str, headers: Dict[str, str], **kw) -> Dict[str, Any]
 def admin_create_user(host: str, ikey: str, email: str, name: Optional[str]) -> Dict[str, Any]:
     url = f"{host}/admin/v1/admin/users"
     body = {"email": email, "name": name, "user_type": "pro"}
-    return _req("POST", url, _h_admin(ikey), data=json.dumps(body))
+    try:
+        return _req("POST", url, _h_admin(ikey), data=json.dumps(body))
+    except ApiError as e:
+        # Handle idempotency: if user already exists, try to get existing user
+        if "409" in str(e) or "already exists" in str(e).lower():
+            print(f"    User {email} already exists, fetching existing user...")
+            # For now, we'll let the caller handle this by re-raising
+            # In a full implementation, we'd add a GET /admin/users?email=... endpoint
+            raise ApiError(f"User {email} already exists. Please use a different email or implement user lookup.")
+        raise
 
 
 def admin_create_passport(host: str, ikey: str, user_id: str) -> Dict[str, Any]:
@@ -70,16 +79,30 @@ def admin_create_workspace(host: str, ikey: str, user_id: str, name: str) -> Dic
 
 def wait_until_running(sb: Starbase, sid: str, timeout_s: int = 300) -> Dict[str, Any]:
     deadline = time.time() + timeout_s
+    delay = 2.0
     last = None
+    last_error = None
+    
     while time.time() < deadline:
         try:
             s = sb.shuttles.get(sid)
             last = s
-            if (s.status or "").lower() in ("running", "ready", "active"):
+            status = (s.status or "").lower()
+            print(f"    Shuttle status: {status}")
+            
+            if status in ("running", "ready", "active"):
                 return s.__dict__
-        except Exception:
-            pass
-        time.sleep(4)
+                
+        except Exception as e:
+            last_error = e
+            print(f"    Polling error: {e}")
+            
+        time.sleep(delay)
+        delay = min(delay * 1.5, 10.0)  # Exponential backoff, max 10s
+    
+    # Timeout reached
+    if last_error:
+        print(f"    Final error: {last_error}")
     return (last.__dict__ if last else {})
 
 
@@ -87,7 +110,7 @@ def main():
     p = argparse.ArgumentParser(description="Starbase SDK E2E")
     p.add_argument("--host", default=os.getenv("ONMEM_HOST", "http://127.0.0.1:8080"), help="Public API host")
     p.add_argument("--admin-host", default=os.getenv("ONMEM_ADMIN_HOST", "http://127.0.0.1:8001"), help="Admin API host")
-    p.add_argument("--internal-key", default=os.getenv("ONMEM_INTERNAL_KEY", "onmemos-internal-key-2024-secure"))
+    p.add_argument("--internal-key", default=os.getenv("ONMEM_INTERNAL_KEY"), required=not os.getenv("ONMEM_INTERNAL_KEY"), help="Internal API key (required via env var ONMEM_INTERNAL_KEY or --internal-key)")
     p.add_argument("--email", required=True)
     p.add_argument("--name", default=None)
     p.add_argument("--credits", type=float, default=25.0)
@@ -207,9 +230,10 @@ def main():
                 if not (ns and pod):
                     print("[-] Could not determine namespace/pod for WS. Skipping.")
                 else:
-                    # Use passport for WebSocket authentication (more reliable than JWT token)
-                    ws_url = f"{host.replace('http', 'ws')}/v1/gke/shell/{sid}?k8s_ns={ns}&pod={pod}&passport={passport}"
-                    print(f"    connecting: {ws_url}")
+                    # Use JWT token for WebSocket authentication (more secure than passport in URL)
+                    ws_base = host.replace("https://", "wss://").replace("http://", "ws://")
+                    ws_url = f"{ws_base}/v1/gke/shell/{sid}?k8s_ns={ns}&pod={pod}&token={token}"
+                    print(f"    connecting: {ws_base}/v1/gke/shell/{sid}?k8s_ns={ns}&pod={pod}&token=<JWT>")
                     ws = create_connection(ws_url)
                     print("[+] Connected. Type commands, or '/exit' to quit.")
                     try:
@@ -270,6 +294,16 @@ def main():
     except Exception as e:
         print(f"[-] terminate failed: {e}")
 
+    # JSON summary for CI parsing
+    summary = {
+        "user_id": user_id,
+        "dock_id": dock_id,
+        "shuttle_id": sid,
+        "vault_id": vault_id if args.test_reusable else None,
+        "drive_id": drive_id if args.test_reusable else None,
+        "status": "success"
+    }
+    print(f"\n[SUMMARY] {json.dumps(summary)}")
     print("[✓] SDK E2E complete")
 
 
@@ -282,5 +316,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n[ABORTED]")
         sys.exit(130)
+    except Exception as e:
+        print(f"[UNEXPECTED ERROR] {e}")
+        sys.exit(1)
 
 

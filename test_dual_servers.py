@@ -93,8 +93,10 @@ def run_sdk_test(public_host, admin_host, internal_key):
     timestamp = int(time.time())
     email = f"test.user+{timestamp}@example.com"
     
+    # Use file-relative path for robustness
+    sdk_path = Path(__file__).with_name("sdk_e2e.py")
     cmd = [
-        sys.executable, "sdk_e2e.py",
+        sys.executable, str(sdk_path),
         "--host", public_host,
         "--admin-host", admin_host,
         "--internal-key", internal_key,
@@ -125,13 +127,22 @@ def run_sdk_test(public_host, admin_host, internal_key):
         return False
 
 def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="OnMemOS v3 Dual Server Test")
+    parser.add_argument("--admin-host", default=os.getenv("ONMEM_ADMIN_HOST", "http://127.0.0.1:8001"), help="Admin server host")
+    parser.add_argument("--public-host", default=os.getenv("ONMEM_PUBLIC_HOST", "http://127.0.0.1:8080"), help="Public server host")
+    parser.add_argument("--internal-key", default=os.getenv("ONMEM_INTERNAL_KEY"), required=not os.getenv("ONMEM_INTERNAL_KEY"), help="Internal API key (required via env var ONMEM_INTERNAL_KEY or --internal-key)")
+    
+    args = parser.parse_args()
+    
     print("🚀 OnMemOS v3 Dual Server Test")
     print("=" * 50)
     
     # Configuration
-    admin_host = "http://127.0.0.1:8001"
-    public_host = "http://127.0.0.1:8080"
-    internal_key = "onmemos-internal-key-2024-secure"
+    admin_host = args.admin_host
+    public_host = args.public_host
+    internal_key = args.internal_key
     
     # Test server health
     print("\n📡 Testing server health...")
