@@ -1,3 +1,6 @@
+# Python Dependencies for OnMemOS v3
+# Install with: pip install -r requirements.txt
+
 fastapi==0.115.0
 uvicorn==0.30.6
 uvloop==0.20.0
@@ -8,3 +11,16 @@ websockets==12.0
 zstandard==0.23.0
 PyJWT==2.9.0
 aiosqlite==0.20.0
+python-dotenv==1.1.1
+
+# Google Cloud Python libraries
+google-cloud-run==0.11.0
+google-cloud-storage==3.4.0
+google-cloud-container==2.59.0
+google-cloud-compute==1.37.0
+google-auth==2.40.3
+google-auth-oauthlib==1.2.2
+google-auth-httplib2==0.2.0
+
+# System Dependencies
+# See requirements-system.txt for gcloud CLI, kubectl, and Docker installation

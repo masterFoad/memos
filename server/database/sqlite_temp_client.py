@@ -53,12 +53,27 @@ class SQLiteTempClient(CompleteDatabaseInterface):
         """Connect to SQLite database and initialize tables"""
         try:
             async with self._lock:
-                self._connection = await aiosqlite.connect(str(self.db_path))
+                # Close existing connection if any
+                if hasattr(self, '_connection') and self._connection:
+                    try:
+                        await self._connection.close()
+                    except:
+                        pass
+                
+                # Add timeout and better connection options
+                self._connection = await aiosqlite.connect(
+                    str(self.db_path),
+                    timeout=30.0  # 30 second timeout
+                )
                 self._connection.row_factory = aiosqlite.Row
                 
-                # Reliability / concurrency
+                # Reliability / concurrency settings
                 await self._connection.execute("PRAGMA foreign_keys = ON;")
                 await self._connection.execute("PRAGMA journal_mode = WAL;")
+                await self._connection.execute("PRAGMA synchronous = NORMAL;")
+                await self._connection.execute("PRAGMA cache_size = 1000;")
+                await self._connection.execute("PRAGMA temp_store = MEMORY;")
+                await self._connection.execute("PRAGMA busy_timeout = 30000;")  # 30 second busy timeout
                 
                 # Initialize database schema
                 await self._create_tables()
@@ -530,15 +545,23 @@ class SQLiteTempClient(CompleteDatabaseInterface):
                 return self._convert_datetime_fields(dict(row)) if row else None
     
     async def _execute_update(self, query: str, params: Tuple = ()) -> bool:
-        """Execute an update/insert query"""
-        try:
-            async with self._lock:
-                await self._connection.execute(query, params)
-                await self._connection.commit()
-                return True
-        except Exception as e:
-            logger.error(f"Database update failed: {e}")
-            return False
+        """Execute an update/insert query with retry logic"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self._lock:
+                    await self._connection.execute(query, params)
+                    await self._connection.commit()
+                    return True
+            except Exception as e:
+                if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+                    logger.warning(f"Database locked, retrying... (attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(0.1 * (attempt + 1))  # Exponential backoff
+                    continue
+                else:
+                    logger.error(f"Database update failed: {e}")
+                    return False
+        return False
     
     def _convert_datetime_fields(self, row: Dict[str, Any]) -> Dict[str, Any]:
         """Convert datetime string fields to datetime objects and parse JSON fields"""
@@ -614,6 +637,19 @@ class SQLiteTempClient(CompleteDatabaseInterface):
             return await self._execute_single(query, (user_id,))
         except Exception as e:
             logger.error(f"Error getting user: {e}")
+            return None
+    
+    async def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
+        """Get user by email"""
+        try:
+            query = "SELECT * FROM users WHERE email = ?"
+            user = await self._execute_single(query, (email,))
+            if user:
+                # Add 'id' field to match expected format
+                user['id'] = user['user_id']
+            return user
+        except Exception as e:
+            logger.error(f"Error getting user by email: {e}")
             return None
     
     async def update_user(self, user_id: str, **kwargs) -> bool:

@@ -4,6 +4,7 @@ Internal admin-only endpoints for UI management
 """
 
 import logging
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -20,13 +21,36 @@ logger = logging.getLogger(__name__)
 # Load settings
 settings = load_settings()
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan"""
+    # Startup
+    try:
+        db = await get_database_client_async()
+        await db.connect()
+        logger.info("✅ Admin server database connected")
+    except Exception as e:
+        logger.error(f"❌ Admin server database connection failed: {e}")
+        raise
+    
+    yield
+    
+    # Shutdown
+    try:
+        db = await get_database_client_async()
+        await db.disconnect()
+        logger.info("✅ Admin server database disconnected")
+    except Exception as e:
+        logger.error(f"❌ Admin server shutdown error: {e}")
+
 # Create FastAPI app for admin
 app = FastAPI(
     title="OnMemOS v3 Admin API",
     description="Internal admin endpoints for UI management",
     version="3.0.0",
     docs_url="/admin/docs",
-    redoc_url="/admin/redoc"
+    redoc_url="/admin/redoc",
+    lifespan=lifespan
 )
 
 # CORS middleware for admin UI
@@ -41,27 +65,6 @@ app.add_middleware(
 # Include admin-only routers
 app.include_router(admin_api.router, prefix="/admin")
 app.include_router(gke_api.router, prefix="/admin")  # GKE endpoints are admin-only
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize database connection"""
-    try:
-        db = await get_database_client_async()
-        await db.connect()
-        logger.info("✅ Admin server database connected")
-    except Exception as e:
-        logger.error(f"❌ Admin server database connection failed: {e}")
-        raise
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
-    try:
-        db = await get_database_client_async()
-        await db.disconnect()
-        logger.info("✅ Admin server database disconnected")
-    except Exception as e:
-        logger.error(f"❌ Admin server shutdown error: {e}")
 
 @app.get("/admin/health")
 async def health_check():

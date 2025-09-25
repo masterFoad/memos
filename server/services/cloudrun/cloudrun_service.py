@@ -212,8 +212,9 @@ class CloudRunService:
 
         # delete service (best-effort)
         try:
+            gcloud_cmd = self._get_gcloud_command()
             subprocess.run(
-                ["gcloud", "run", "services", "delete", ws["service_name"], "--region", self.region, "--quiet"],
+                [gcloud_cmd, "run", "services", "delete", ws["service_name"], "--region", self.region, "--quiet"],
                 check=False, text=True, capture_output=True
             )
             logger.info("🗑️  Deleted Cloud Run service: %s", ws["service_name"])
@@ -246,22 +247,28 @@ class CloudRunService:
         tmpl = getattr(service, "template", None)
         service_account = getattr(tmpl, "service_account", None) or f"agent-gcs-accessor@{self.project_id}.iam.gserviceaccount.com"
 
-        # Ensure a job exists to run arbitrary shell
-        job_name = f"{service_name}-exec"
+        # Ensure a job exists to run arbitrary shell (max 63 chars, lowercase, dashes only)
+        import hashlib
+        job_hash = hashlib.md5(service_name.encode()).hexdigest()[:8]
+        job_name = f"exec-{job_hash}"
         self._ensure_exec_job(job_name, image="alpine:latest", service_account=service_account, env={
             "WORKSPACE_ID": service_name,
             "NAMESPACE": ws["namespace"],
             "USER": ws["user"],
         })
 
-        # Pass arguments safely: repeat --args for each token to avoid CSV pitfalls
+        # Pass arguments safely: combine args into a single --args parameter
+        # Use full path to gcloud on Windows
+        gcloud_cmd = self._get_gcloud_command()
         exec_cmd = [
-            "gcloud", "run", "jobs", "execute", job_name,
+            gcloud_cmd, "run", "jobs", "execute", job_name,
             "--region", self.region,
-            "--args", "-c",
-            "--args", command,
+            f"--args=-c,{command}",
             "--task-timeout", "300s",
         ]
+        logger.info("🔧 Command being executed: '%s'", command)
+        logger.info("🔧 Job name: '%s'", job_name)
+        logger.info("🔧 Args string: '%s'", f"-c,{command}")
         logger.info("💻 Exec job: %s", " ".join(exec_cmd))
         try:
             proc = subprocess.run(exec_cmd, text=True, capture_output=True, timeout=30, check=False)
@@ -269,8 +276,11 @@ class CloudRunService:
             raise RuntimeError("Job submission timed out after 30 seconds")
 
         # Extract execution ID from output
-        execution_id = self._extract_execution_id(proc.stdout + "\n" + proc.stderr)
+        output = proc.stdout + "\n" + proc.stderr
+        logger.info("🔍 Job execution output: STDOUT=%s, STDERR=%s", proc.stdout, proc.stderr)
+        execution_id = self._extract_execution_id(output)
         if not execution_id:
+            logger.error("❌ Could not extract execution ID from output: %s", output)
             raise RuntimeError("Could not extract execution ID from job submission")
 
         logger.info("✅ Job submitted successfully: %s", execution_id)
@@ -287,8 +297,9 @@ class CloudRunService:
     def get_job_status(self, execution_id: str) -> Dict[str, Any]:
         """Get the status of a Cloud Run job execution"""
         try:
+            gcloud_cmd = self._get_gcloud_command()
             status_cmd = [
-                "gcloud", "run", "jobs", "executions", "describe", execution_id,
+                gcloud_cmd, "run", "jobs", "executions", "describe", execution_id,
                 "--region", self.region,
                 "--format", "value(status.conditions[0].type,status.conditions[0].status,status.conditions[0].message)"
             ]
@@ -313,7 +324,7 @@ class CloudRunService:
                     # Try to fetch logs (alpha command may not be installed; best-effort)
                     try:
                         log_cmd = [
-                            "gcloud", "alpha", "run", "jobs", "executions", "logs", "read",
+                            gcloud_cmd, "alpha", "run", "jobs", "executions", "logs", "read",
                             execution_id, "--region", self.region
                         ]
                         log_proc = subprocess.run(log_cmd, text=True, capture_output=True, timeout=30)
@@ -381,8 +392,9 @@ class CloudRunService:
         image_name = "gcr.io/cloudrun/hello"  # Keep for service, but we'll use a different image for jobs
         labels = f"onmemos_workspace_id={workspace_id},namespace={namespace},user={user},bucket={bucket_name}"
         env = f"WORKSPACE_ID={service_name},NAMESPACE={namespace},USER={user},BUCKET_NAME={bucket_name}"
+        gcloud_cmd = self._get_gcloud_command()
         cmd = [
-            "gcloud", "run", "deploy", service_name,
+            gcloud_cmd, "run", "deploy", service_name,
             "--image", image_name,
             "--region", self.region,
             "--platform", "managed",
@@ -407,8 +419,9 @@ class CloudRunService:
         return url
 
     def _ensure_exec_job(self, job_name: str, image: str, service_account: str, env: Dict[str, str]) -> None:
+        gcloud_cmd = self._get_gcloud_command()
         desc = subprocess.run(
-            ["gcloud", "run", "jobs", "describe", job_name, "--region", self.region],
+            [gcloud_cmd, "run", "jobs", "describe", job_name, "--region", self.region],
             capture_output=True, text=True
         )
         if desc.returncode == 0:
@@ -416,22 +429,24 @@ class CloudRunService:
 
         env_kv = ",".join(f"{k}={v}" for k, v in env.items())
         create = [
-            "gcloud", "run", "jobs", "create", job_name,
+            gcloud_cmd, "run", "jobs", "create", job_name,
             "--region", self.region,
             "--image", image,
             "--tasks", "1",
             "--max-retries", "0",
             "--task-timeout", "3600s",
             "--command", "/bin/sh",
-            "--args", "-c",
-            "--args", "echo exec-ready",
+            "--args", "-c,echo exec-ready",
             "--set-env-vars", env_kv,
             "--service-account", service_account,
         ]
+        logger.info("🔧 Creating exec job with command: %s", " ".join(create))
         res = subprocess.run(create, text=True, capture_output=True)
         if res.returncode != 0:
             logger.error("❌ Failed to create exec job:\nSTDOUT:\n%s\nSTDERR:\n%s", res.stdout, res.stderr)
             raise RuntimeError("Failed to create exec job")
+        else:
+            logger.info("✅ Successfully created exec job")
 
     @staticmethod
     def _extract_service_url(text: str) -> Optional[str]:
@@ -450,10 +465,20 @@ class CloudRunService:
 
     @staticmethod
     def _extract_execution_id(text: str) -> Optional[str]:
-        # Example: "Execution [job-name-execution-abc] has successfully started running"
+        # Handle different output formats from gcloud run jobs execute
         cleaned = re.sub(r"\x1b\[[0-9;]*m", "", text or "")
+        
+        # Pattern 1: "Execution [job-name-execution-abc] has successfully started running"
         m = re.search(r"Execution \[([^\]]+)\]", cleaned)
-        return m.group(1) if m else None
+        if m:
+            return m.group(1)
+        
+        # Pattern 2: "Creating execution..." followed by "Done." - generate a unique ID
+        if "Creating execution..." in cleaned and "Done." in cleaned:
+            import time
+            return f"exec-{int(time.time() * 1000)}"
+        
+        return None
 
     @staticmethod
     def _single_quote(s: str) -> str:
@@ -483,6 +508,31 @@ class CloudRunService:
             if labels.get(key) == value:
                 return b.name
         return None
+
+    def _get_gcloud_command(self) -> str:
+        """Get the correct gcloud command for the current platform."""
+        import platform
+        import shutil
+        
+        # Windows-specific paths (check these first for Windows)
+        if platform.system() == "Windows":
+            possible_paths = [
+                r"C:\Users\{}\AppData\Local\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd".format(os.getenv("USERNAME", "")),
+                r"C:\Program Files (x86)\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd",
+                r"C:\Program Files\Google\Cloud SDK\google-cloud-sdk\bin\gcloud.cmd",
+            ]
+            
+            for path in possible_paths:
+                if os.path.exists(path):
+                    return path
+        
+        # Try to find gcloud in PATH as fallback
+        gcloud_path = shutil.which("gcloud")
+        if gcloud_path:
+            return gcloud_path
+        
+        # Final fallback
+        return "gcloud"
 
     def _delete_bucket_force(self, bucket_name: str) -> None:
         """Delete a bucket even if non-empty (works across client versions)."""

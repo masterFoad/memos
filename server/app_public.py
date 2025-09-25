@@ -4,6 +4,7 @@ User-facing endpoints for SDK clients
 """
 
 import logging
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -20,13 +21,36 @@ logger = logging.getLogger(__name__)
 # Load settings
 settings = load_settings()
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan"""
+    # Startup
+    try:
+        db = await get_database_client_async()
+        await db.connect()
+        logger.info("✅ Public server database connected")
+    except Exception as e:
+        logger.error(f"❌ Public server database connection failed: {e}")
+        raise
+    
+    yield
+    
+    # Shutdown
+    try:
+        db = await get_database_client_async()
+        await db.disconnect()
+        logger.info("✅ Public server database disconnected")
+    except Exception as e:
+        logger.error(f"❌ Public server shutdown error: {e}")
+
 # Create FastAPI app for public SDK
 app = FastAPI(
     title="OnMemOS v3 Public API",
     description="User-facing endpoints for SDK clients",
     version="3.0.0",
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=lifespan
 )
 
 # CORS middleware for public access
@@ -41,27 +65,6 @@ app.add_middleware(
 # Include public routers
 app.include_router(sessions_api.router)
 app.include_router(storage_api.router)
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize database connection"""
-    try:
-        db = await get_database_client_async()
-        await db.connect()
-        logger.info("✅ Public server database connected")
-    except Exception as e:
-        logger.error(f"❌ Public server database connection failed: {e}")
-        raise
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
-    try:
-        db = await get_database_client_async()
-        await db.disconnect()
-        logger.info("✅ Public server database disconnected")
-    except Exception as e:
-        logger.error(f"❌ Public server shutdown error: {e}")
 
 @app.get("/health")
 async def health_check():

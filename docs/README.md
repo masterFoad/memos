@@ -21,33 +21,56 @@ All backends are accessible through a single, unified API that automatically sel
 git clone https://github.com/your-org/onmemos-v3.git
 cd onmemos-v3
 
+# Activate conda environment
+conda activate nanosage
+
 # Install Python dependencies
 pip install -r requirements.txt
 
-# Install gcloud CLI (if not already installed)
-curl https://sdk.cloud.google.com | bash
-exec -l $SHELL
-gcloud init
+# Install Starbase SDK
+pip install -e starbase_local/
+
+# Install system dependencies (Windows)
+winget install Google.CloudSDK
+winget install Kubernetes.kubectl
 ```
 
 ### 2. Configure Environment
 
 ```bash
-# Set up environment variables
-export PROJECT_ID="your-project-id"
-export REGION="us-central1"
-export GOOGLE_APPLICATION_CREDENTIALS="path/to/service-account.json"
-export API_KEY="onmemos-internal-key-2024-secure"
+# Set up Google Cloud authentication
+gcloud auth activate-service-account --key-file="path/to/service-account-key.json"
+gcloud config set project ai-engine-448418
 
-# Set up GKE (if using GKE backend)
-gcloud container clusters get-credentials your-cluster --region=us-central1
+# Install GKE auth plugin
+gcloud components install gke-gcloud-auth-plugin
+
+# Set up kubectl context for your cluster
+gcloud container clusters get-credentials onmemos-autopilot --region us-central1
+# OR for the other cluster:
+gcloud container clusters get-credentials imru-cluster --region us-central1
+
+# Verify kubectl connection
+kubectl get nodes
 ```
 
-### 3. Start the Server
+### 3. Start the Servers
 
 ```bash
-# Start the development server
-python -m uvicorn server.app:app --host 127.0.0.1 --port 8080 --reload
+# Start both servers (in separate terminals)
+conda activate nanosage
+python start_admin_server.py    # Admin server on port 8001
+python start_public_server.py   # Public server on port 8080
+```
+
+### 4. Run E2E Test
+
+```bash
+# Test with GKE Autopilot (default)
+python sdk_e2e.py --internal-key "onmemos-internal-key-2024-secure" --email "test@example.com" --name "Test User"
+
+# Test with Cloud Run
+python sdk_e2e.py --internal-key "onmemos-internal-key-2024-secure" --email "test@example.com" --name "Test User" --provider cloud_run
 ```
 
 ### 4. Create Your First Session
@@ -226,19 +249,54 @@ gcloud projects add-iam-policy-binding $PROJECT_ID \
 
 ### Common Issues
 
-1. **Authentication errors**
-   ```bash
-   gcloud auth list
-   gcloud config get-value project
-   ```
+1. **Database Lock Errors**
+   - **Problem**: `database is locked` errors when running multiple servers
+   - **Solution**: The servers now use proper connection management with try/finally blocks
+   - **Fix**: Restart servers if issues persist: `taskkill /f /im python.exe` then restart
 
-2. **Pod not ready (GKE)**
+2. **Admin API 500 Errors**
+   - **Problem**: Admin endpoints return 500 Internal Server Error
+   - **Solution**: Fixed with idempotent user creation - existing users are returned instead of causing UNIQUE constraint violations
+   - **Fix**: The system now handles duplicate email addresses gracefully
+
+3. **Authentication Errors**
+   - **Problem**: `ONMEMOS_INTERNAL_API_KEY not set` errors
+   - **Solution**: API key is now fetched dynamically from environment on each request
+   - **Fix**: Ensure `.env` file contains `ONMEMOS_INTERNAL_API_KEY=onmemos-internal-key-2024-secure`
+
+4. **FastAPI Lifespan Issues**
+   - **Problem**: Server startup/shutdown errors with deprecated event handlers
+   - **Solution**: Updated to use modern `lifespan` context manager
+   - **Fix**: Servers now properly manage database connections during startup/shutdown
+
+5. **GCP Authentication Issues**
+   - **Problem**: `Your default credentials were not found`
+   - **Solution**: Set up service account authentication and kubectl context
+   - **Fix**: Run `gcloud auth activate-service-account --key-file="service-account-key.json"`
+
+6. **Kubectl Connection Issues**
+   - **Problem**: `current-context is not set` or cluster connection failures
+   - **Solution**: Configure kubectl context for your GCP cluster
+   - **Fix**: Run `gcloud container clusters get-credentials onmemos-autopilot --region us-central1`
+
+### Recent Fixes Applied
+
+- ✅ **Database Connection Management**: Added proper try/finally blocks in admin API endpoints
+- ✅ **Idempotent User Creation**: Users with existing emails are returned instead of causing errors
+- ✅ **Dynamic API Key Lookup**: API key is fetched from environment on each request
+- ✅ **FastAPI Lifespan Management**: Updated to use modern lifespan context manager
+- ✅ **SQLite Concurrency**: Added WAL mode, timeouts, and retry logic for better concurrency
+- ✅ **GCP Integration**: Set up service account authentication and kubectl context
+
+### Provider-Specific Issues
+
+1. **Pod not ready (GKE)**
    ```bash
    kubectl get pods -A | grep onmemos
    kubectl describe pod <pod-name> -n <namespace>
    ```
 
-3. **Service not accessible (Cloud Run)**
+2. **Service not accessible (Cloud Run)**
    ```bash
    gcloud run services list --region=us-central1
    ```

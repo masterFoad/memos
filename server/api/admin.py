@@ -51,58 +51,78 @@ class CreateWorkspaceBody(BaseModel):
 @router.post("/users")
 async def create_user(body: CreateUserBody, _: dict = Depends(require_api_key)):
     db = get_database_client()
-    ok = await db.connect()
-    if not ok:
-        raise HTTPException(500, "database connection failed")
-    user_id = f"user-{uuid.uuid4().hex[:8]}"
-    user = await db.create_user(user_id, body.email, body.user_type, body.name)
-    if not user:
-        raise HTTPException(500, "failed to create user")
-    return {"user": user}
+    try:
+        ok = await db.connect()
+        if not ok:
+            raise HTTPException(500, "database connection failed")
+        
+        # Check if user already exists by email
+        existing_user = await db.get_user_by_email(body.email)
+        if existing_user:
+            logger.info(f"User with email {body.email} already exists, returning existing user")
+            return {"user": existing_user}
+        
+        # Create new user only if email doesn't exist
+        user_id = f"user-{uuid.uuid4().hex[:8]}"
+        user = await db.create_user(user_id, body.email, body.user_type, body.name)
+        if not user:
+            raise HTTPException(500, "failed to create user")
+        return {"user": user}
+    finally:
+        await db.disconnect()
 
 
 @router.post("/passports")
 async def create_passport(body: CreatePassportBody, _: dict = Depends(require_api_key)):
     db = get_database_client()
-    await db.connect()
-    passport = await db.create_passport(body.user_id, body.name, body.permissions)
-    if not passport:
-        raise HTTPException(500, "failed to create passport")
-    return {
-        "passport_id": passport.get("passport_id"),
-        "passport_key": passport.get("passport_key"),
-        "user_id": passport.get("user_id"),
-        "name": passport.get("name"),
-        "permissions": passport.get("permissions", []),
-        "created_at": passport.get("created_at"),
-    }
+    try:
+        await db.connect()
+        passport = await db.create_passport(body.user_id, body.name, body.permissions)
+        if not passport:
+            raise HTTPException(500, "failed to create passport")
+        return {
+            "passport_id": passport.get("passport_id"),
+            "passport_key": passport.get("passport_key"),
+            "user_id": passport.get("user_id"),
+            "name": passport.get("name"),
+            "permissions": passport.get("permissions", []),
+            "created_at": passport.get("created_at"),
+        }
+    finally:
+        await db.disconnect()
 
 
 @router.post("/credits/add")
 async def add_credits(body: AddCreditsBody, _: dict = Depends(require_api_key)):
     db = get_database_client()
-    await db.connect()
-    ok = await db.add_credits(body.user_id, body.amount, body.source, body.description)
-    if not ok:
-        raise HTTPException(500, "failed to add credits")
-    return {"ok": True}
+    try:
+        await db.connect()
+        ok = await db.add_credits(body.user_id, body.amount, body.source, body.description)
+        if not ok:
+            raise HTTPException(500, "failed to add credits")
+        return {"ok": True}
+    finally:
+        await db.disconnect()
 
 
 @router.post("/workspaces")
 async def create_workspace(body: CreateWorkspaceBody, _: dict = Depends(require_api_key)):
     db = get_database_client()
-    await db.connect()
-    ws_id = body.workspace_id or f"ws-{body.user_id}-{uuid.uuid4().hex[:6]}"
-    ws = await db.create_workspace(
-        user_id=body.user_id,
-        workspace_id=ws_id,
-        name=body.name,
-        resource_package=body.resource_package.value,
-        description=body.description,
-    )
-    if not ws:
-        raise HTTPException(500, "failed to create workspace")
-    return {"workspace": ws}
+    try:
+        await db.connect()
+        ws_id = body.workspace_id or f"ws-{body.user_id}-{uuid.uuid4().hex[:6]}"
+        ws = await db.create_workspace(
+            user_id=body.user_id,
+            workspace_id=ws_id,
+            name=body.name,
+            resource_package=body.resource_package.value,
+            description=body.description,
+        )
+        if not ws:
+            raise HTTPException(500, "failed to create workspace")
+        return {"workspace": ws}
+    finally:
+        await db.disconnect()
 
 
 class EnsureIdentityBody(BaseModel):

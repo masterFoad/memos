@@ -9,9 +9,20 @@ from server.database.factory import get_database_client_async
 
 _settings = load_settings()
 
-# API Key for internal authentication (hidden from public)
-# This should be stored in environment variables in production
-INTERNAL_API_KEY = os.getenv("ONMEMOS_INTERNAL_API_KEY")
+def _get_internal_api_key() -> str:
+    """Fetch the internal API key from environment each time it is needed."""
+    api_key = os.getenv("ONMEMOS_INTERNAL_API_KEY")
+    if api_key:
+        return api_key
+
+    raise HTTPException(
+        status_code=500,
+        detail={
+            "error": "Server not configured",
+            "message": "ONMEMOS_INTERNAL_API_KEY not set",
+            "suggestion": "Set ONMEMOS_INTERNAL_API_KEY environment variable"
+        },
+    )
 
 def get_auth_token(authorization: Optional[str] = Header(None)) -> str:
     if not authorization or not authorization.lower().startswith("bearer "):
@@ -46,13 +57,9 @@ def verify_api_key(x_api_key: Optional[str] = Header(None)) -> bool:
                 "suggestion": "Include X-API-Key header with valid API key"
             }
         )
-    
-    if INTERNAL_API_KEY is None:
-        raise HTTPException(
-            status_code=500,
-            detail={"error": "Server not configured", "message": "ONMEMOS_INTERNAL_API_KEY not set"},
-        )
-    if not secrets.compare_digest(x_api_key, INTERNAL_API_KEY):
+
+    internal_api_key = _get_internal_api_key()
+    if not secrets.compare_digest(x_api_key, internal_api_key):
         raise HTTPException(
             status_code=403,
             detail={
@@ -61,7 +68,7 @@ def verify_api_key(x_api_key: Optional[str] = Header(None)) -> bool:
                 "suggestion": "Check your API key and try again"
             }
         )
-    
+
     return True
 
 def require_api_key(_: bool = Depends(verify_api_key)) -> Dict:
@@ -79,7 +86,7 @@ async def verify_passport(x_api_key: Optional[str] = Header(None)) -> Dict:
                 "suggestion": "Include X-API-Key header with valid passport"
             }
         )
-    
+
     try:
         db = await get_database_client_async()
         user_info = await db.validate_passport(x_api_key)
@@ -92,7 +99,7 @@ async def verify_passport(x_api_key: Optional[str] = Header(None)) -> Dict:
                     "suggestion": "Check your passport and try again"
                 }
             )
-        
+
         return {
             "user_id": user_info["user_id"],
             "email": user_info["email"],
@@ -101,7 +108,7 @@ async def verify_passport(x_api_key: Optional[str] = Header(None)) -> Dict:
             "permissions": user_info.get("permissions") or [],
             "passport_key": x_api_key
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:

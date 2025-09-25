@@ -1,0 +1,26 @@
+# System Requirements for OnMemOS v3
+# These are system-level tools that need to be installed separately
+
+# Google Cloud CLI
+# Windows: winget install Google.CloudSDK
+# macOS: brew install google-cloud-sdk
+# Linux: curl https://sdk.cloud.google.com | bash
+
+# Kubernetes CLI
+# Windows: winget install Kubernetes.kubectl
+# macOS: brew install kubectl
+# Linux: curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+
+# Docker (for local development)
+# Windows: Install Docker Desktop
+# macOS: brew install docker
+# Linux: apt-get install docker.io
+
+# Git (for version control)
+# Windows: winget install Git.Git
+# macOS: brew install git ? cking r
+# Linux: apt-get install git
+
+
+
+

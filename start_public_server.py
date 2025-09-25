@@ -13,6 +13,16 @@ from pathlib import Path
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+    print("✅ Loaded environment variables from .env file")
+except ImportError:
+    print("⚠️ python-dotenv not installed, skipping .env file loading")
+except Exception as e:
+    print(f"⚠️ Error loading .env file: {e}")
+
 # Set environment variables
 os.environ.setdefault("ONMEMOS_INTERNAL_API_KEY", "onmemos-internal-key-2024-secure")
 os.environ.setdefault("AUTO_PROVISION_IDENTITY", "true")
